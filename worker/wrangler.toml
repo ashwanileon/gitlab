@@ -1,0 +1,7 @@
+name = "httpstream-cf-proxy"
+main = "cf-proxy-worker.js"
+compatibility_date = "2024-11-01"
+
+# Deploy with:  cd worker && npx wrangler deploy
+# After deploy, set CF_WORKER_URL on your Koyeb app to the worker URL, e.g.
+#   https://httpstream-cf-proxy.<your-subdomain>.workers.dev
