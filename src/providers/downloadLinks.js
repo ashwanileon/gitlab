@@ -6,6 +6,10 @@ const { HEADERS, CONFIG, agent } = require('../config');
 const { languageTags, withTimeout } = require('../utils');
 const { loadExtractor } = require('../extractors');
 
+// Used by ExtraFlix. Fetches the detail page, collects external hoster links,
+// and resolves the directly-reachable ones (pixeldrain, streamtape, drivehub,
+// linkshub, hubdrive, mdrive, direct media). HubCloud links resolve to nothing
+// (handled in loadExtractor) and are dropped.
 async function getDownloadLinks(mediaUrl) {
   HEADERS.Referer = new URL(mediaUrl).origin + '/';
   let data;
@@ -13,19 +17,7 @@ async function getDownloadLinks(mediaUrl) {
     const resp = await axios.get(mediaUrl, { headers:HEADERS, httpsAgent:agent, timeout:12000 });
     data = resp.data;
   } catch (e) {
-    try {
-      const { fetchUrlWithBypass } = require('../cloudflare-bypass');
-      // Stream requests have a hard Stremio-facing deadline. Detail pages that
-      // cannot be bypassed quickly should fail fast so other providers can still
-      // return playable links instead of being blocked by a 30–60s FlareSolverr
-      // attempt.
-      const bypassResult = await fetchUrlWithBypass(mediaUrl, { timeout: 8000, budget: 10000 });
-      if (bypassResult) {
-        data = bypassResult;
-      }
-    } catch (bypassErr) {
-      return { finalLinks: [], isMovie: true };
-    }
+    return { finalLinks: [], isMovie: true };
   }
   if (!data) return { finalLinks: [], isMovie: true };
 
@@ -40,40 +32,9 @@ async function getDownloadLinks(mediaUrl) {
 
     let allLinks = [];
 
-    if (mediaUrl.includes('4khdhub.link')) {
-      $('.download-item').each((_, item) => {
-        const box = $(item);
-        const header = box.find('.download-header').text().trim().replace(/\s+/g, ' ');
-        const sizeMatch = header.match(/([\d.]+\s*(?:GB|MB|KB))/i);
-        const qualityMatch = header.match(/(\d{3,4})p/i);
-        const variantMatch = header.match(/\(([^)]+)\)/);
-        const size = sizeMatch ? sizeMatch[1] : '';
-        const quality = qualityMatch ? parseInt(qualityMatch[1]) : 0;
-        const variant = variantMatch ? variantMatch[1] : '';
-        const langs = languageTags(header).join(', ');
-
-        box.find('a[href]').each((__, el) => {
-          const href = $(el).attr('href') || '';
-          const text = $(el).text().trim().replace(/\s+/g, ' ');
-          if (!href || !href.startsWith('http') || href.includes('.zip')) return;
-          if (
-            href.includes('hubcloud') || href.includes('hubdrive') || href.includes('hubcdn') ||
-            href.includes('pixeldrain') || href.includes('streamtape') || href.includes('hdstream4u') ||
-            href.includes('hubstream') || /\.(mp4|mkv|m3u8)/.test(href)
-          ) {
-            allLinks.push({
-              url: href, quality, size, text,
-              source: `${text.replace(/^Download\s+/i, '').trim() || 'Stream'}${variant ? ' [' + variant + ']' : ''}${langs ? ' [' + langs + ']' : ''}${size ? ' [' + size + ']' : ''}`,
-              isMovie, episode: null
-            });
-          }
-        });
-      });
-    }
-
     if (mediaUrl.includes('extraflix.')) {
       const pageLangs = languageTags(typeRaw).join(', ');
-      $('.download-options-section a[href], .Untouched-download-links-section a[href], .entry-content a[href*="extralink"], .entry-content a[href*="pixeldrain"], .entry-content a[href*="streamtape"], .entry-content a[href*="hubcloud"], .entry-content a[href*="hubdrive"], .entry-content a[href*="linkshub"]').each((_, el) => {
+      $('.download-options-section a[href], .Untouched-download-links-section a[href], .entry-content a[href*="extralink"], .entry-content a[href*="pixeldrain"], .entry-content a[href*="streamtape"], .entry-content a[href*="drivehub"], .entry-content a[href*="hubdrive"], .entry-content a[href*="linkshub"]').each((_, el) => {
         const href = $(el).attr('href') || '';
         const text = $(el).text().trim().replace(/\s+/g, ' ');
         if (!href || !href.startsWith('http')) return;
@@ -117,16 +78,15 @@ async function getDownloadLinks(mediaUrl) {
       const text = $(el).text().trim();
 
       if (
-        href && href.startsWith('http') && !href.includes(CONFIG.MAIN_URL) && !href.includes('.zip') &&
+        href && href.startsWith('http') && !href.includes('.zip') &&
         (
-          href.includes('hubcdn') || href.includes('hubcloud') || href.includes('hubdrive') ||
-          href.includes('drivehub') || href.includes('linkshub') || href.includes('gadgetsweb') ||
+          href.includes('hubdrive') || href.includes('drivehub') || href.includes('linkshub') ||
           href.includes('pixeldrain') || href.includes('streamtape') || href.includes('hdstream4u') ||
-          href.includes('hubstream') || /\.(mp4|mkv|m3u8)/.test(href)
+          /\.(mp4|mkv|m3u8)/.test(href)
         )
       ) {
-        const qualityMatch = text.match(/(\d{3,4})[pP]|(\d{3,4})[pP]/);
-        const quality = qualityMatch ? parseInt(qualityMatch[1] || qualityMatch[2]) : 0;
+        const qualityMatch = text.match(/(\d{3,4})[pP]/);
+        const quality = qualityMatch ? parseInt(qualityMatch[1]) : 0;
         const sizeMatch = text.match(/\[([0-9.]+\s*(?:GB|MB|KB))\]/i);
         const size = sizeMatch ? sizeMatch[1] : '';
 
@@ -144,65 +104,17 @@ async function getDownloadLinks(mediaUrl) {
       return q === 0 || q >= minQuality;
     });
 
-    if (CONFIG.IS_SERVERLESS) {
-      allLinks.sort((a, b) => {
-        const qa = typeof a.quality === 'number' ? a.quality : parseInt(a.quality) || 0;
-        const qb = typeof b.quality === 'number' ? b.quality : parseInt(b.quality) || 0;
-        return qb - qa;
-      });
-    }
-    if (CONFIG.IS_VERCEL && (mediaUrl.includes('4khdhub.link') || mediaUrl.includes('extraflix.'))) {
-      allLinks = allLinks.slice(0, 4);
-    }
-
-    if (!isMovie) {
-      const episodeMap = new Map();
-      $('h3, h4, h5').each((_, el) => {
-        const text = $(el).text();
-        const epMatch = text.match(/(?:EPiSODE|EP|E)\s*(\d+)/i);
-        if (epMatch) {
-          const ep = parseInt(epMatch[1]);
-          if (!episodeMap.has(ep)) episodeMap.set(ep, []);
-          $(el).nextUntil('h3, h4, h5').each((__, node) => {
-            const href = $(node).attr('href') || $(node).find('a').attr('href');
-            if (href) episodeMap.get(ep).push(href);
-          });
-        }
-      });
-      if (episodeMap.size > 0) {
-        allLinks = allLinks.map(link => {
-          for (const [ep, urls] of episodeMap) {
-            if (urls.includes(link.url)) { link.episode = ep; break; }
-          }
-          return link;
-        });
-      }
-    }
-
     const resolveLink = async (link) => {
-      if (link.url.includes('search-recover.php')) return [];
       try {
-        if (
-          link.url.includes('gadgetsweb') || link.url.includes('hubcloud') || link.url.includes('hubdrive') ||
-          link.url.includes('drivehub') || link.url.includes('linkshub') || link.url.includes('hubcdn') ||
-          link.url.includes('extralink')
-        ) {
-          const isSlowHubcloud = link.url.includes('hubcloud') || link.url.includes('hubcdn');
-          const resolveMs = isSlowHubcloud && CONFIG.IS_SERVERLESS
-            ? 5000
-            : mediaUrl.includes('extraflix.')
-              ? (CONFIG.IS_SERVERLESS ? 12000 : 15000)
-              : (mediaUrl.includes('4khdhub.link') && CONFIG.IS_SERVERLESS ? 8000 : (CONFIG.IS_SERVERLESS ? 7000 : 5000));
-          const resolved = await withTimeout(loadExtractor(link.url, mediaUrl), resolveMs, []);
-          if (resolved && resolved.length) {
-            return resolved.map(r => ({
-              ...r,
-              quality: r.quality && !['Unknown', 'M3U8', 'Stream'].includes(String(r.quality)) ? r.quality : link.quality,
-              size: r.size || link.size,
-              labelSource: link.source,
-              episode: link.episode,
-            }));
-          }
+        const resolved = await withTimeout(loadExtractor(link.url, mediaUrl), 12000, []);
+        if (resolved && resolved.length) {
+          return resolved.map(r => ({
+            ...r,
+            quality: r.quality && !['Unknown', 'M3U8', 'Stream'].includes(String(r.quality)) ? r.quality : link.quality,
+            size: r.size || link.size,
+            labelSource: link.source,
+            episode: link.episode,
+          }));
         }
         if (/\.(mp4|mkv|m3u8|webm|avi|mov)(?:$|[?#])/i.test(link.url)) {
           return [link];
@@ -217,26 +129,12 @@ async function getDownloadLinks(mediaUrl) {
     };
 
     const finalLinks = [];
-    if (mediaUrl.includes('extraflix.') && !CONFIG.IS_SERVERLESS) {
-      for (const link of allLinks) finalLinks.push(...await resolveLink(link));
-    } else {
-      const results = await Promise.allSettled(allLinks.map(resolveLink));
-      results.forEach(r => { if (r.status === 'fulfilled') finalLinks.push(...r.value); });
-    }
-
-    const wrapperHosts = ['hubdrive.', 'drivehub.', 'linkshub.', 'gadgetsweb.', 'hubcloud.', 'hubcdn.', 'hdstream4u.', 'hubstream.'];
-    const hasResolvedDirect = finalLinks.some(l => {
-      try { return !wrapperHosts.some(h => new URL(l.url).hostname.includes(h)); } catch (_) { return false; }
-    });
-    const filteredLinks = hasResolvedDirect && !mediaUrl.includes('extraflix.')
-      ? finalLinks.filter(l => {
-          try { return !wrapperHosts.some(h => new URL(l.url).hostname.includes(h)); } catch (_) { return false; }
-        })
-      : finalLinks;
+    const results = await Promise.allSettled(allLinks.map(resolveLink));
+    results.forEach(r => { if (r.status === 'fulfilled') finalLinks.push(...r.value); });
 
     const seen = new Set();
     return {
-      finalLinks: filteredLinks.filter(l => {
+      finalLinks: finalLinks.filter(l => {
         if (!l.url || l.url.includes('.zip') || seen.has(l.url)) return false;
         seen.add(l.url); return true;
       }).slice(0, 50),

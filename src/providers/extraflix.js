@@ -33,17 +33,6 @@ async function searchExtraFlix(query) {
       } catch (_) {}
     }
 
-    if (!body) {
-      const { fetchUrlWithBypass } = require('../cloudflare-bypass');
-      for (const url of searchUrls) {
-        const result = await fetchUrlWithBypass(url, { timeout: 30000 });
-        if (result) {
-          body = result;
-          break;
-        }
-      }
-    }
-
     if (!body) return [];
 
     const $ = cheerio.load(body);

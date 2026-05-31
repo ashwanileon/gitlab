@@ -5,7 +5,6 @@ const cheerio = require('cheerio');
 const { HEADERS, CONFIG, agent } = require('../config');
 const { loadExtractor } = require('../extractors');
 const { withTimeout } = require('../utils');
-const { fetchUrlWithBypass } = require('../cloudflare-bypass');
 
 const EXCLUDED_DOMAINS = [
   'facebook', 'twitter', 'instagram', 'pinterest', 'linkedin',
@@ -38,16 +37,6 @@ async function searchUHDRodeo(query) {
           break;
         }
       } catch (_) {}
-    }
-
-    if (!body) {
-      for (const searchUrl of searchUrls) {
-        const result = await fetchUrlWithBypass(searchUrl, { timeout: 25000 });
-        if (result) {
-          body = result;
-          break;
-        }
-      }
     }
 
     if (!body) return [];
@@ -106,13 +95,6 @@ async function getUHDRodeoLinks(mediaUrl) {
         pageHtml = resp.data;
       }
     } catch (_) {}
-
-    if (!pageHtml) {
-      const bypassResult = await fetchUrlWithBypass(mediaUrl, { timeout: 25000 });
-      if (bypassResult) {
-        pageHtml = bypassResult;
-      }
-    }
 
     if (!pageHtml) return [];
 

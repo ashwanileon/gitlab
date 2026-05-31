@@ -8,30 +8,16 @@ const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: true });
 
 const CONFIG = {
   MAIN_URL: 'https://new1.hdhub4u.limo',
-  FOURTH_K_URL: 'https://4khdhub.link',
   EXTRAFLIX_URL: 'https://e3.extraflix.mobi',
-  MWSDB_URL: 'https://mwsdb.vercel.app',
   MOVIESDRIVES_URL: 'https://new2.moviesdrives.my',
   UHDMOVIES_URL: 'https://uhdmovies.rodeo',
   DOMAINS_URL: 'https://raw.githubusercontent.com/phisher98/TVVVV/refs/heads/main/domains.json',
   CINEMETA: 'https://v3-cinemeta.strem.io',
   TMDB_API: 'https://api.themoviedb.org/3',
   TMDB_KEY: process.env.TMDB_KEY || '',
-  CF_WORKER_URL: process.env.CF_WORKER_URL || '',
   IS_VERCEL: !!process.env.VERCEL,
   IS_KOYEB: !!process.env.KOYEB_APP_NAME,
   IS_SERVERLESS: !!(process.env.VERCEL || process.env.KOYEB_APP_NAME),
-  // Common hubcloud domain variants to try — TLDs change frequently
-  HUB_CLOUD_DOMAINS: [
-    'hubcloud.dad',
-    'hubcloud.foo',
-    'hubcloud.bar',
-    'hubcloud.ink',
-    'hubcloud.to',
-    'hubcloud.one',
-    'hubcloud.site',
-    'hubcloud.cyou',
-  ],
 };
 
 const HEADERS = {
@@ -70,25 +56,13 @@ async function fetchDomain() {
         HEADERS.Referer = CONFIG.MAIN_URL + '/';
       }
 
-      const fourK = pickDomain(data, ['4khdhub', '4kHDHub', '4KHDHub']);
-      if (fourK) CONFIG.FOURTH_K_URL = fourK;
-
       const md = pickDomain(data, ['moviesdrive', 'moviesdrives', 'MoviesDrive']);
       if (md) CONFIG.MOVIESDRIVES_URL = md;
 
       const uhd = pickDomain(data, ['UHDMovies', 'uhdmovies', 'UHDMOVIES']);
       if (uhd) CONFIG.UHDMOVIES_URL = uhd;
 
-      // hubcloud TLD rotates often — promote the resolved one to the front of the list
-      const hub = pickDomain(data, ['hubcloud', 'HubCloud', 'HUBCLOUD']);
-      if (hub) {
-        try {
-          const host = new URL(hub).hostname;
-          CONFIG.HUB_CLOUD_DOMAINS = [host, ...CONFIG.HUB_CLOUD_DOMAINS.filter(d => d !== host)];
-        } catch (_) {}
-      }
-
-      console.log('[domain] resolved:', CONFIG.MAIN_URL, '| 4k:', CONFIG.FOURTH_K_URL, '| md:', CONFIG.MOVIESDRIVES_URL, '| uhd:', CONFIG.UHDMOVIES_URL);
+      console.log('[domain] resolved | md:', CONFIG.MOVIESDRIVES_URL, '| uhd:', CONFIG.UHDMOVIES_URL);
     } catch (e) {
       console.error('[domain] fetch failed:', e.message, '— using hardcoded fallbacks');
     }

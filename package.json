@@ -1,7 +1,7 @@
 {
   "name": "httpstream",
-  "version": "2.3.0",
-  "description": "Multi-source Stremio addon scraping HTTP stream links (HDHub4u, 4KHDHub, ExtraFlix, MoviesDrives, UHDRodeo)",
+  "version": "3.0.0",
+  "description": "Multi-source Stremio addon scraping HTTP stream links (ExtraFlix, MoviesDrives, UHDRodeo)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

@@ -2,15 +2,12 @@
 
 const express = require('express');
 const axios = require('axios');
-const { CONFIG, fetchDomain, getMeta, agent } = require('./src/config');
+const { CONFIG, fetchDomain, getMeta, agent, HEADERS } = require('./src/config');
 const { buildStreams, withTimeout, streamLabel, bestMatch } = require('./src/utils');
 const {
-  searchHDHub4u, findDirectPage, search4KHDHub4u, searchExtraFlix,
-  searchUHDRodeo, getUHDRodeoLinks, searchMoviesDrives, getMoviesDrivesLinks,
-  searchMWSDb, getMWSDbStreams, getDownloadLinks
+  searchExtraFlix, searchUHDRodeo, getUHDRodeoLinks,
+  searchMoviesDrives, getMoviesDrivesLinks, getDownloadLinks,
 } = require('./src/providers');
-
-const cache = require('./src/cache');
 
 const app = express();
 app.use((req, res, next) => {
@@ -19,38 +16,16 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Stream cache-warming ────────────────────────────────────────────
-// HubCloud (the terminal host for every source) sits behind a Cloudflare
-// challenge that only FlareSolverr can solve, taking ~30-45s per link. That is
-// longer than Stremio's ~20-30s request window, so a single live request can
-// never resolve HubCloud in time. The fix:
-//   1. Return any already-resolved streams for the title immediately.
-//   2. Run extraction with a short, Stremio-friendly budget and return whatever
-//      fast hosts (ExtraFlix, pixeldrain, direct files) produced.
-//   3. Keep resolving in the BACKGROUND past the response, writing the full
-//      result (including slow HubCloud links) into the cache.
-// The next Stremio poll for the same title then returns the complete set
-// instantly. Background jobs are deduplicated per title to avoid spawning
-// duplicate FlareSolverr storms on repeated polls.
-const STREAM_CACHE_TTL = 20 * 60 * 1000; // 20 min — matches FlareSolverr cache window
-const BACKGROUND_BUDGET = 90 * 1000;     // allow slow HubCloud solves to finish
-const inFlight = new Map();              // cacheKey -> Promise (dedupe background jobs)
-
-function streamCacheKey(type, id) {
-  return `streams:${type}:${id}`;
-}
-
-// Foreground deadline: how long Stremio waits on the FIRST request before we
-// reply with whatever fast hosts resolved. Kept short because slow HubCloud
-// links now resolve in the background and are served from cache on the next
-// poll, so there is no need to hold Stremio for the full solve.
-const TOTAL_BUDGET = 12000;
+// All retained sources (ExtraFlix, MoviesDrives, UHDRodeo) resolve through
+// directly-reachable hosts, so extraction is fast. Keep the deadline under
+// Stremio's ~20-30s abandon window.
+const TOTAL_BUDGET = 20000;
 
 app.get('/manifest.json', (_, res) => res.json({
   id: 'community.httpstreams.stremio',
-  version: '2.3.0',
+  version: '3.0.0',
   name: 'http streams',
-  description: 'Multi-source streams from HDHub4u, 4KHDHub, ExtraFlix, MoviesDrives & UHDRodeo',
+  description: 'Multi-source streams from ExtraFlix, MoviesDrives & UHDRodeo',
   resources: ['stream'],
   types: ['movie', 'series'],
   idPrefixes: ['tt'],
@@ -63,9 +38,10 @@ app.get('/stream/:type/:id.json', async (req, res) => {
   const { type } = req.params;
   const sn = season ? parseInt(season) : null;
   const en = episode ? parseInt(episode) : null;
-  const cacheKey = streamCacheKey(type, req.params.id);
+  const allStreams = [];
 
   let responded = false;
+  let meta;
   const safeRespond = (payload) => {
     if (!responded) {
       responded = true;
@@ -74,94 +50,26 @@ app.get('/stream/:type/:id.json', async (req, res) => {
     }
   };
 
-  // collector shared between the foreground response and the background job
-  const allStreams = [];
-  let meta;
-
-  // 1) Serve cached streams immediately if a previous (possibly background)
-  //    run already resolved them. This is the path that makes streams appear
-  //    reliably in Stremio after the first warm-up request.
-  const cached = cache.store.get(cacheKey);
-  if (cached && Date.now() < cached.expiry && Array.isArray(cached.value) && cached.value.length) {
-    return res.json({ streams: cached.value });
-  }
-
-  // Persist whatever we have resolved so far into the cache (called by both
-  // the foreground deadline and the background job).
-  const persist = () => {
-    try {
-      const streams = buildStreams(allStreams, meta);
-      if (streams.length) {
-        cache.store.set(cacheKey, { value: streams, expiry: Date.now() + STREAM_CACHE_TTL });
-      }
-      return streams;
-    } catch (_) { return []; }
-  };
-
-  // Foreground deadline: respond with whatever is ready well within Stremio's
-  // request window, then let the background job keep resolving.
   const deadlineTimer = setTimeout(() => {
-    console.warn(`[stream] foreground deadline reached, sending ${allStreams.length} partial streams (background continues)`);
-    safeRespond({ streams: persist() });
+    console.warn(`[stream] deadline reached, sending ${allStreams.length} partial streams`);
+    safeRespond({ streams: buildStreams(allStreams, meta) });
   }, TOTAL_BUDGET);
 
-  // The actual extraction work, shared by foreground and background.
-  // `budget` controls how long slow (HubCloud/FlareSolverr) extractors may run.
-  const runExtraction = async (budget) => {
-    const searchPromises = [
-      withTimeout(searchHDHub4u(meta.title), 9000, []),
-      withTimeout(search4KHDHub4u(meta.title), 9000, []),
-      withTimeout(searchExtraFlix(meta.title), 12000, []),
-      withTimeout(searchUHDRodeo(meta.title), 12000, []),
+  try {
+    meta = (await Promise.all([
+      withTimeout(fetchDomain(), 3000),
+      withTimeout(getMeta(imdbId, type), 5000),
+    ]))[1];
+
+    if (!meta) { return safeRespond({ streams: [] }); }
+
+    const [extraResults, uhdSearchRes, mdSearchRes] = await Promise.allSettled([
+      withTimeout(searchExtraFlix(meta.title), 10000, []),
+      withTimeout(searchUHDRodeo(meta.title), 10000, []),
       withTimeout(searchMoviesDrives(meta.title), 8000, []),
-      withTimeout(searchMWSDb(meta.title), 8000, []),
-    ];
-    const [hdResults, fourKResults, extraResults, uhdSearchRes, mdSearchRes] =
-      await Promise.allSettled(searchPromises).then(r => r.map(p => p.status === 'fulfilled' ? p.value : []));
+    ]).then(r => r.map(p => p.status === 'fulfilled' ? p.value : []));
 
-    const slowBudget = budget;
     const extractionPromises = [];
-
-    // ── 4KHDHub4u
-    if (fourKResults.length) {
-      const match = bestMatch(meta.title, fourKResults, sn, type);
-      if (match) extractionPromises.push((async () => {
-        try {
-          const { finalLinks, isMovie } = await withTimeout(getDownloadLinks(match.url), slowBudget, { finalLinks:[], isMovie:true });
-          let filtered = finalLinks;
-          if (!isMovie && en !== null) filtered = finalLinks.filter(l => l.episode === en);
-          filtered.slice(0, 15).forEach(l => {
-            const q = typeof l.quality === 'number' ? l.quality : parseInt(l.quality) || 0;
-            const label = streamLabel('4KHDHub', q, l);
-            allStreams.push({ name: label.name, title: label.title, url: l.url });
-          });
-        } catch (e) { console.error('[4kResult]', e.message); }
-      })());
-    }
-
-    // ── HDHub4u
-    extractionPromises.push((async () => {
-      let hdList = hdResults.length ? hdResults : (meta.year ? await withTimeout(searchHDHub4u(`${meta.title} ${meta.year}`), 8000, []) : []);
-      if (!hdList.length) {
-        const direct = await withTimeout(findDirectPage(meta.title, meta.year), 5000, null);
-        if (direct) hdList = [{ title: `${meta.title} (direct)`, url: direct }];
-      }
-      if (hdList.length) {
-        const match = bestMatch(meta.title, hdList, sn, type);
-        if (match) {
-          try {
-            const { finalLinks, isMovie } = await withTimeout(getDownloadLinks(match.url), slowBudget, { finalLinks:[], isMovie:true });
-            let filtered = finalLinks;
-            if (!isMovie && en !== null) filtered = finalLinks.filter(l => l.episode === en);
-            filtered.forEach(l => {
-              const q = typeof l.quality === 'number' ? l.quality : parseInt(l.quality) || 0;
-              const label = streamLabel('HDHub4u', q, l);
-              allStreams.push({ name: label.name, title: label.title, url: l.url });
-            });
-          } catch (e) { console.error('[hdResult]', e.message); }
-        }
-      }
-    })());
 
     // ── ExtraFlix
     extractionPromises.push((async () => {
@@ -170,7 +78,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         const match = bestMatch(meta.title, extraList, sn, type);
         if (match) {
           try {
-            const { finalLinks, isMovie } = await withTimeout(getDownloadLinks(match.url), slowBudget, { finalLinks:[], isMovie:true });
+            const { finalLinks, isMovie } = await withTimeout(getDownloadLinks(match.url), 15000, { finalLinks:[], isMovie:true });
             let filtered = finalLinks;
             if (!isMovie && en !== null) filtered = finalLinks.filter(l => l.episode === en);
             filtered.slice(0, 20).forEach(l => {
@@ -191,7 +99,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         const uhdMatch = bestMatch(meta.title, uhdResults, sn, type);
         if (uhdMatch) {
           try {
-            const uhdLinks = await withTimeout(getUHDRodeoLinks(uhdMatch.url), slowBudget, []);
+            const uhdLinks = await withTimeout(getUHDRodeoLinks(uhdMatch.url), 15000, []);
             uhdLinks.slice(0, 12).forEach(l => {
               const q = typeof l.quality === 'number' ? l.quality : parseInt(l.quality) || 0;
               const label = streamLabel('UHDRodeo', q, l);
@@ -210,7 +118,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         const mdMatch = bestMatch(meta.title, mdResults, sn, type);
         if (mdMatch) {
           try {
-            const mdLinks = await withTimeout(getMoviesDrivesLinks(mdMatch.url), slowBudget, []);
+            const mdLinks = await withTimeout(getMoviesDrivesLinks(mdMatch.url), 15000, []);
             mdLinks.slice(0, 12).forEach(l => {
               const q = typeof l.quality === 'number' ? l.quality : parseInt(l.quality) || 0;
               const label = streamLabel('MoviesDrives', q, l);
@@ -222,236 +130,23 @@ app.get('/stream/:type/:id.json', async (req, res) => {
     })());
 
     await Promise.allSettled(extractionPromises);
-    persist();
-  };
-
-  try {
-    meta = (await Promise.all([
-      withTimeout(fetchDomain(), 3000),
-      withTimeout(getMeta(imdbId, type), 5000),
-    ]))[1];
-
-    if (!meta) { return safeRespond({ streams: [] }); }
-
-    // Start the FULL extraction (long budget) once per title. The same promise
-    // serves the foreground (raced against TOTAL_BUDGET) and continues running
-    // in the background to warm the cache.
-    let job = inFlight.get(cacheKey);
-    if (!job) {
-      job = runExtraction(BACKGROUND_BUDGET)
-        .catch(e => console.error('[stream-bg]', e.message))
-        .finally(() => inFlight.delete(cacheKey));
-      inFlight.set(cacheKey, job);
-      // Safety net: ensure the background job cannot run forever.
-      setTimeout(() => inFlight.delete(cacheKey), BACKGROUND_BUDGET + 5000);
-    }
-
-    // Respond as soon as EITHER the job finishes OR the foreground deadline
-    // fires (whichever comes first). The deadlineTimer handles the timeout
-    // case; here we handle fast completion.
-    await job;
-    safeRespond({ streams: persist() });
+    safeRespond({ streams: buildStreams(allStreams, meta) });
   } catch (e) {
     console.error('[stream]', e.message);
     safeRespond({ streams: buildStreams(allStreams, meta) });
   }
 });
 
-// Deep diagnostic: test MoviesDrives extraction step-by-step (for Koyeb debugging)
-app.get('/debug-md', async (req, res) => {
-  const imdbId = req.query.id || 'tt39664733';
-  const result = { steps: {} };
-  try {
-    const { getMeta, CONFIG, HEADERS, agent } = require('./src/config');
-    const { searchMoviesDrives, getMoviesDrivesLinks } = require('./src/providers/moviesdrives');
-    const cheerio = require('cheerio');
-    const { bestMatch, withTimeout } = require('./src/utils');
-
-    // Step 1: Get meta
-    const meta = await withTimeout(getMeta(imdbId, 'movie'), 5000, null);
-    if (!meta) { result.error = 'No meta for ' + imdbId; return res.json(result); }
-    result.meta = meta;
-
-    // Step 2: Search
-    const t1 = Date.now();
-    let mdResults = await withTimeout(searchMoviesDrives(meta.title), 8000, []);
-    if (!mdResults.length && meta.year) {
-      mdResults = await withTimeout(searchMoviesDrives(`${meta.title} ${meta.year}`), 6000, []);
-    }
-    result.steps.search = { results: mdResults.length, time_ms: Date.now() - t1 };
-    if (!mdResults.length) { return res.json(result); }
-
-    // Step 3: bestMatch
-    const mdMatch = bestMatch(meta.title, mdResults, null, 'movie');
-    result.steps.bestMatch = mdMatch ? { title: mdMatch.title.substring(0, 100) } : null;
-    if (!mdMatch) { return res.json(result); }
-    const movieUrl = mdMatch.url;
-
-    // Step 4: Fetch movie page and extract mdrive links
-    result.steps.pageFetch = {};
-    let pageHtml = null;
-    let mdriveUrls = [];
-    try {
-      const resp = await withTimeout(axios.get(movieUrl, {
-        headers: { ...HEADERS, Referer: CONFIG.MOVIESDRIVES_URL + '/' },
-        httpsAgent: agent,
-        timeout: 15000,
-      }), 16000, null);
-      if (resp) {
-        pageHtml = typeof resp.data === 'string' ? resp.data : String(resp.data);
-        result.steps.pageFetch.ok = true;
-        result.steps.pageFetch.length = pageHtml.length;
-
-        // Parse h5 links
-        const $ = cheerio.load(pageHtml);
-        const h5s = $('h5').toArray();
-        result.steps.pageFetch.h5_count = h5s.length;
-
-        for (let i = 0; i < h5s.length - 1; i++) {
-          const heading = $(h5s[i]).text().trim().replace(/\s+/g, ' ');
-          if (!heading || heading.length < 10) continue;
-          const linkEl = $(h5s[i + 1]).find('a[href^="http"]').first();
-          const href = (linkEl.length ? linkEl.attr('href') : '') || $(h5s[i + 1]).find('a[href]').first().attr('href') || '';
-          if (href && href.startsWith('http') && !href.includes('moviesdrives.my') && !href.includes('facebook') && !href.includes('twitter') && !href.includes('pinterest') && !href.includes('imdb')) {
-            mdriveUrls.push({ href: href.substring(0, 120), heading: heading.substring(0, 60) });
-          }
-        }
-        result.steps.pageFetch.mdrive_links_found = mdriveUrls.length;
-        result.steps.pageFetch.mdrive_links = mdriveUrls;
-      } else {
-        result.steps.pageFetch.ok = false;
-        result.steps.pageFetch.error = 'Response was null from withTimeout';
-      }
-    } catch (e) {
-      result.steps.pageFetch.ok = false;
-      result.steps.pageFetch.error = e.message;
-    }
-
-    if (!mdriveUrls.length) { return res.json(result); }
-
-    // Step 5: Test direct HTTP fetch to each mdrive domain separately
-    const mdriveHosts = [];
-    mdriveUrls.forEach(u => {
-      if (u.href.includes('mdrive.lol')) mdriveHosts.push('mdrive.lol');
-      if (u.href.includes('mdrive.ink')) mdriveHosts.push('mdrive.ink');
-    });
-    const uniqueHosts = [...new Set(mdriveHosts)];
-    result.steps.mdriveDirectTest = {};
-
-    for (const host of uniqueHosts) {
-      // Use the first URL for this host
-      const testUrl = mdriveUrls.find(u => u.href.includes(host))?.href;
-      if (!testUrl) continue;
-      const ts = Date.now();
-      try {
-        const resp = await withTimeout(axios.get(testUrl, {
-          headers: { ...HEADERS },
-          httpsAgent: agent,
-          timeout: 10000,
-        }), 11000, null);
-        if (resp) {
-          const html = typeof resp.data === 'string' ? resp.data : String(resp.data);
-          const $$ = cheerio.load(html);
-          const hubcloudLinks = [];
-          $$('a[href]').each((_, el) => {
-            const href = $$(el).attr('href') || '';
-            if (href.includes('hubcloud') || href.includes('hubdrive') || href.includes('drivehub') || href.includes('linkshub')) {
-              hubcloudLinks.push(href.substring(0, 100));
-            }
-          });
-          result.steps.mdriveDirectTest[host] = {
-            ok: true,
-            status: resp.status,
-            length: html.length,
-            time_ms: Date.now() - ts,
-            hubcloud_links: hubcloudLinks.length,
-            hubcloud_samples: hubcloudLinks.slice(0, 3),
-            snippet: html.substring(0, 2000),
-          };
-        } else {
-          result.steps.mdriveDirectTest[host] = { ok: false, error: 'Timeout or null response', time_ms: Date.now() - ts };
-        }
-      } catch (e) {
-        result.steps.mdriveDirectTest[host] = {
-          ok: false,
-          error: (e.message || '').substring(0, 200),
-          status: e.response?.status,
-          time_ms: Date.now() - ts,
-        };
-      }
-    }
-
-    // Step 6: Test hubcloud domain resolution directly
-    result.steps.hubcloudTest = {};
-    for (const domain of CONFIG.HUB_CLOUD_DOMAINS.slice(0, 4)) {
-      const testUrl = `https://${domain}/drive/test`;
-      const ts = Date.now();
-      try {
-        const resp = await withTimeout(axios.get(testUrl, {
-          headers: { 'User-Agent': HEADERS['User-Agent'], 'Accept': 'text/html', 'Accept-Encoding': 'gzip, deflate' },
-          httpsAgent: agent,
-          timeout: 5000,
-        }), 6000, null);
-        result.steps.hubcloudTest[domain] = {
-          ok: !!resp,
-          status: resp?.status,
-          length: resp?.data?.length,
-          time_ms: Date.now() - ts,
-        };
-      } catch (e) {
-        result.steps.hubcloudTest[domain] = {
-          ok: false,
-          status: e.response?.status,
-          error: (e.message || '').substring(0, 150),
-          time_ms: Date.now() - ts,
-        };
-      }
-    }
-
-    // Step 7: Full extraction via getMoviesDrivesLinks
-    result.steps.fullExtraction = {};
-    try {
-      const te = Date.now();
-      const links = await withTimeout(getMoviesDrivesLinks(movieUrl), 30000, []);
-      result.steps.fullExtraction.streams = links.length;
-      result.steps.fullExtraction.time_ms = Date.now() - te;
-      result.steps.fullExtraction.details = links.slice(0, 3).map(l => ({
-        source: (l.source || '').substring(0, 80),
-        quality: l.quality,
-        url: (l.url || '').substring(0, 120),
-      }));
-    } catch (e) {
-      result.steps.fullExtraction.error = e.message;
-    }
-  } catch (e) { result.error = e.message; }
-  res.json(result);
-});
-
 app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: Date.now() }));
 
 app.get('/livetest', async (req, res) => {
-  const out = { steps: {}, fixes: [], version: '2.3.0' };
+  const out = { steps: {}, fixes: [], version: '3.0.0' };
   try {
     try {
       const domain = await fetchDomain();
       out.steps.domain_used = domain;
-      out.fixes.push(`✅ Domain resolved: ${domain}`);
-    } catch (e) {
-      out.steps.domain_error = e.message;
-    }
-
-    try {
-      const hdResults = await searchHDHub4u('Superman');
-      out.steps.hdhub4u_results = hdResults.length;
-      if (hdResults.length) out.steps.hdhub4u_sample = hdResults.slice(0,3);
-      out.fixes.push(`${hdResults.length ? '✅' : '❌'} HDHub4u search: ${hdResults.length} results`);
-    } catch (e) { out.steps.hdhub4u_error = e.message; }
-
-    try {
-      const fourKResults = await search4KHDHub4u('Superman');
-      out.steps.fourth_k_results = fourKResults.length;
-      out.fixes.push(`${fourKResults.length ? '✅' : '❌'} 4KHDHub4u search: ${fourKResults.length} results`);
-    } catch (e) { out.steps.fourth_k_error = e.message; }
+      out.fixes.push(`✅ Domain resolved`);
+    } catch (e) { out.steps.domain_error = e.message; }
 
     try {
       const extraResults = await searchExtraFlix('Superman');
@@ -472,26 +167,19 @@ app.get('/livetest', async (req, res) => {
         const mdMatch = bestMatch('Superman', mdResults, null, 'movie');
         out.steps.moviesdrives_match = mdMatch ? { title: mdMatch.title, url: mdMatch.url } : null;
         if (mdMatch) {
-          const mdLinks = await withTimeout(getMoviesDrivesLinks(mdMatch.url), 60000, []);
+          const mdLinks = await withTimeout(getMoviesDrivesLinks(mdMatch.url), 20000, []);
           out.steps.moviesdrives_streams = mdLinks.length;
           out.steps.moviesdrives_stream_sample = mdLinks.slice(0, 3).map(l => ({ source: l.source, quality: l.quality, url: String(l.url || '').substring(0, 120) }));
         }
       }
       out.fixes.push(`${mdResults.length ? '✅' : '❌'} MoviesDrives search: ${mdResults.length} results${out.steps.moviesdrives_streams !== undefined ? `, streams: ${out.steps.moviesdrives_streams}` : ''}`);
     } catch (e) { out.steps.moviesdrives_error = e.message; }
-
-    try {
-      const mwsResults = await searchMWSDb('Superman');
-      out.steps.mwsdb_results = mwsResults ? mwsResults.length : 0;
-      out.fixes.push(`${(mwsResults && mwsResults.length) ? '✅' : '❌'} MWSDb search: ${mwsResults ? mwsResults.length : 0} results`);
-    } catch (e) { out.steps.mwsdb_error = e.message; }
   } catch (e) {
     out.error = e.message;
   }
   res.json(out);
 });
 
-// Debug endpoint: fetches raw HTML from search URLs for diagnostics
 app.get('/debug-search', async (req, res) => {
   const { url, source } = req.query;
   if (!url) return res.json({ error: 'Provide ?url= to fetch' });
@@ -516,11 +204,7 @@ app.get('/debug-search', async (req, res) => {
       snippet,
     });
   } catch (e) {
-    res.json({
-      error: e.message,
-      status: e.response?.status,
-      headers: e.response?.headers,
-    });
+    res.json({ error: e.message, status: e.response?.status });
   }
 });
 
@@ -530,13 +214,13 @@ app.get('/', (req, res) => {
 <style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:system-ui,sans-serif;background:#0a0a0f;color:#eee;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.card{background:#111827;border:1px solid #1f2937;border-radius:20px;padding:40px;max-width:580px;width:100%;text-align:center}h1{font-size:2rem;background:linear-gradient(135deg,#f97316,#dc2626);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}.sub{color:#6b7280;font-size:.85rem;margin:10px 0 20px}.btn{display:inline-block;margin:6px 4px;padding:11px 22px;border-radius:9px;font-weight:700;font-size:.88rem;text-decoration:none}.bp{background:linear-gradient(135deg,#f97316,#dc2626);color:#fff}.bs{background:#1f2937;color:#d1d5db;border:1px solid #374151}.url{margin-top:16px;background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;padding:10px;font-size:.72rem;color:#64748b;word-break:break-all}.dbg{margin-top:16px;padding:14px;background:#0f172a;border-radius:10px;text-align:left}.dbg h3{color:#f97316;margin-bottom:8px;font-size:.78rem;text-transform:uppercase}.dbg a{color:#7dd3fc;font-size:.78rem;word-break:break-all;display:block;margin:5px 0;text-decoration:none}.badge{display:inline-block;background:#1e3a5f;color:#7dd3fc;border-radius:4px;font-size:.7rem;padding:2px 6px;margin:2px}</style>
 </head><body><div class=card>
 <h1>🎬 http streams</h1>
-<p class=sub>Multi-source Stremio Addon · HubCloud · DriveHub · Hindi/Multi</p>
-<div><span class=badge>v2.3.0</span><span class=badge>HDHub4u</span><span class=badge>4KHDHub</span><span class=badge>ExtraFlix</span><span class=badge>MoviesDrives</span><span class=badge>UHDRodeo</span></div><br>
+<p class=sub>Multi-source Stremio Addon · ExtraFlix · MoviesDrives · UHDRodeo</p>
+<div><span class=badge>v3.0.0</span><span class=badge>ExtraFlix</span><span class=badge>MoviesDrives</span><span class=badge>UHDRodeo</span></div><br>
 <a class="btn bp" href="stremio://${req.get('host')}/manifest.json">⚡ Install in Stremio</a>
 <a class="btn bs" href="/manifest.json">Manifest</a>
 <div class=url>${host}/manifest.json</div>
 <div class=dbg><h3>🔬 Diagnostics</h3>
-<a href="/livetest">🚨 /livetest — Full source health check</a>
+<a href="/livetest">🚨 /livetest — Source health check</a>
 <a href="/stream/movie/tt5950044.json">/stream/movie/tt5950044.json (Superman)</a>
 </div></div></body></html>`);
 });
