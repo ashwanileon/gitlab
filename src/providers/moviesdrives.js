@@ -152,10 +152,15 @@ async function getMoviesDrivesLinks(mediaUrl) {
     };
     uniquePairs.sort((a, b) => priority(a.url) - priority(b.url));
 
+    // HubCloud / mdrive links resolve through FlareSolverr, which needs ~30-45s
+    // to solve the Cloudflare challenge. A short budget here kills the solve
+    // before it returns (the cause of "0 resolved streams" despite many
+    // candidates). Give challenge hosts a budget above FlareSolverr's solve
+    // time; fast direct hosts keep a short budget.
     const resolveOne = async (pair) => {
       try {
         const isSlowHubcloud = /(hubcloud|hubloud|hubcdn|mdrive\.lol|gdflix)/i.test(pair.url);
-        const resolved = await withTimeout(loadExtractor(pair.url, mediaUrl), isSlowHubcloud ? 7000 : 8000, []);
+        const resolved = await withTimeout(loadExtractor(pair.url, mediaUrl), isSlowHubcloud ? 48000 : 8000, []);
         if (resolved && resolved.length) {
           return resolved.map(link => ({
             ...link,

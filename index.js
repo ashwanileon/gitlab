@@ -10,6 +10,8 @@ const {
   searchMWSDb, getMWSDbStreams, getDownloadLinks
 } = require('./src/providers');
 
+const cache = require('./src/cache');
+
 const app = express();
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -17,10 +19,32 @@ app.use((req, res, next) => {
   next();
 });
 
-// Stremio typically abandons a stream request after ~20-30s, so keep the
-// overall deadline well under that. Blocked sources fail fast via the
-// circuit breaker, so this budget mainly bounds the slowest live extraction.
-const TOTAL_BUDGET = CONFIG.IS_SERVERLESS ? 22000 : 19000;
+// ── Stream cache-warming ────────────────────────────────────────────
+// HubCloud (the terminal host for every source) sits behind a Cloudflare
+// challenge that only FlareSolverr can solve, taking ~30-45s per link. That is
+// longer than Stremio's ~20-30s request window, so a single live request can
+// never resolve HubCloud in time. The fix:
+//   1. Return any already-resolved streams for the title immediately.
+//   2. Run extraction with a short, Stremio-friendly budget and return whatever
+//      fast hosts (ExtraFlix, pixeldrain, direct files) produced.
+//   3. Keep resolving in the BACKGROUND past the response, writing the full
+//      result (including slow HubCloud links) into the cache.
+// The next Stremio poll for the same title then returns the complete set
+// instantly. Background jobs are deduplicated per title to avoid spawning
+// duplicate FlareSolverr storms on repeated polls.
+const STREAM_CACHE_TTL = 20 * 60 * 1000; // 20 min — matches FlareSolverr cache window
+const BACKGROUND_BUDGET = 90 * 1000;     // allow slow HubCloud solves to finish
+const inFlight = new Map();              // cacheKey -> Promise (dedupe background jobs)
+
+function streamCacheKey(type, id) {
+  return `streams:${type}:${id}`;
+}
+
+// Foreground deadline: how long Stremio waits on the FIRST request before we
+// reply with whatever fast hosts resolved. Kept short because slow HubCloud
+// links now resolve in the background and are served from cache on the next
+// poll, so there is no need to hold Stremio for the full solve.
+const TOTAL_BUDGET = 12000;
 
 app.get('/manifest.json', (_, res) => res.json({
   id: 'community.httpstreams.stremio',
@@ -39,7 +63,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
   const { type } = req.params;
   const sn = season ? parseInt(season) : null;
   const en = episode ? parseInt(episode) : null;
-  let allStreams = [];
+  const cacheKey = streamCacheKey(type, req.params.id);
 
   let responded = false;
   const safeRespond = (payload) => {
@@ -50,24 +74,40 @@ app.get('/stream/:type/:id.json', async (req, res) => {
     }
   };
 
+  // collector shared between the foreground response and the background job
+  const allStreams = [];
+  let meta;
+
+  // 1) Serve cached streams immediately if a previous (possibly background)
+  //    run already resolved them. This is the path that makes streams appear
+  //    reliably in Stremio after the first warm-up request.
+  const cached = cache.store.get(cacheKey);
+  if (cached && Date.now() < cached.expiry && Array.isArray(cached.value) && cached.value.length) {
+    return res.json({ streams: cached.value });
+  }
+
+  // Persist whatever we have resolved so far into the cache (called by both
+  // the foreground deadline and the background job).
+  const persist = () => {
+    try {
+      const streams = buildStreams(allStreams, meta);
+      if (streams.length) {
+        cache.store.set(cacheKey, { value: streams, expiry: Date.now() + STREAM_CACHE_TTL });
+      }
+      return streams;
+    } catch (_) { return []; }
+  };
+
+  // Foreground deadline: respond with whatever is ready well within Stremio's
+  // request window, then let the background job keep resolving.
   const deadlineTimer = setTimeout(() => {
-    console.warn('[stream] deadline reached (' + Math.round(TOTAL_BUDGET/1000) + 's), sending partial result (' + allStreams.length + ' streams)');
-    const streams = buildStreams(allStreams, meta);
-    safeRespond({ streams });
+    console.warn(`[stream] foreground deadline reached, sending ${allStreams.length} partial streams (background continues)`);
+    safeRespond({ streams: persist() });
   }, TOTAL_BUDGET);
 
-  let meta;
-  try {
-    meta = (await Promise.all([
-      withTimeout(fetchDomain(), 3000),
-      withTimeout(getMeta(imdbId, type), 5000),
-    ]))[1];
-
-    if (!meta) { return safeRespond({ streams: [] }); }
-
-    // Start searches concurrently
-    // All providers use their own internal Cloudflare bypass (CF Worker → curl → curl-impersonate)
-    // The bypass module handles failures gracefully — no need to gate providers here
+  // The actual extraction work, shared by foreground and background.
+  // `budget` controls how long slow (HubCloud/FlareSolverr) extractors may run.
+  const runExtraction = async (budget) => {
     const searchPromises = [
       withTimeout(searchHDHub4u(meta.title), 9000, []),
       withTimeout(search4KHDHub4u(meta.title), 9000, []),
@@ -76,34 +116,30 @@ app.get('/stream/:type/:id.json', async (req, res) => {
       withTimeout(searchMoviesDrives(meta.title), 8000, []),
       withTimeout(searchMWSDb(meta.title), 8000, []),
     ];
+    const [hdResults, fourKResults, extraResults, uhdSearchRes, mdSearchRes] =
+      await Promise.allSettled(searchPromises).then(r => r.map(p => p.status === 'fulfilled' ? p.value : []));
 
-    const [hdResults, fourKResults, extraResults, uhdSearchRes, mdSearchRes, mwsResults] = await Promise.allSettled(searchPromises).then(r => r.map(p => p.status === 'fulfilled' ? p.value : []));
-
-    // Prepare link extraction promises
+    const slowBudget = budget;
     const extractionPromises = [];
 
-    // ── 4KHDHub4u streams
-    let fourKHandled = false;
+    // ── 4KHDHub4u
     if (fourKResults.length) {
       const match = bestMatch(meta.title, fourKResults, sn, type);
-      if (match) {
-        fourKHandled = true;
-        extractionPromises.push((async () => {
-          try {
-            const { finalLinks, isMovie } = await withTimeout(getDownloadLinks(match.url), 14000, { finalLinks:[], isMovie:true });
-            let filtered = finalLinks;
-            if (!isMovie && en !== null) filtered = finalLinks.filter(l => l.episode === en);
-            filtered.slice(0, 15).forEach(l => {
-              const q = typeof l.quality === 'number' ? l.quality : parseInt(l.quality) || 0;
-              const label = streamLabel('4KHDHub', q, l);
-              allStreams.push({ name: label.name, title: label.title, url: l.url });
-            });
-          } catch (e) { console.error('[4kResult]', e.message); }
-        })());
-      }
+      if (match) extractionPromises.push((async () => {
+        try {
+          const { finalLinks, isMovie } = await withTimeout(getDownloadLinks(match.url), slowBudget, { finalLinks:[], isMovie:true });
+          let filtered = finalLinks;
+          if (!isMovie && en !== null) filtered = finalLinks.filter(l => l.episode === en);
+          filtered.slice(0, 15).forEach(l => {
+            const q = typeof l.quality === 'number' ? l.quality : parseInt(l.quality) || 0;
+            const label = streamLabel('4KHDHub', q, l);
+            allStreams.push({ name: label.name, title: label.title, url: l.url });
+          });
+        } catch (e) { console.error('[4kResult]', e.message); }
+      })());
     }
 
-    // ── HDHub4u streams
+    // ── HDHub4u
     extractionPromises.push((async () => {
       let hdList = hdResults.length ? hdResults : (meta.year ? await withTimeout(searchHDHub4u(`${meta.title} ${meta.year}`), 8000, []) : []);
       if (!hdList.length) {
@@ -114,7 +150,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         const match = bestMatch(meta.title, hdList, sn, type);
         if (match) {
           try {
-            const { finalLinks, isMovie } = await withTimeout(getDownloadLinks(match.url), 14000, { finalLinks:[], isMovie:true });
+            const { finalLinks, isMovie } = await withTimeout(getDownloadLinks(match.url), slowBudget, { finalLinks:[], isMovie:true });
             let filtered = finalLinks;
             if (!isMovie && en !== null) filtered = finalLinks.filter(l => l.episode === en);
             filtered.forEach(l => {
@@ -127,14 +163,14 @@ app.get('/stream/:type/:id.json', async (req, res) => {
       }
     })());
 
-    // ── ExtraFlix streams
+    // ── ExtraFlix
     extractionPromises.push((async () => {
       let extraList = extraResults.length ? extraResults : (meta.year ? await withTimeout(searchExtraFlix(`${meta.title} ${meta.year}`), 8000, []) : []);
       if (extraList.length) {
         const match = bestMatch(meta.title, extraList, sn, type);
         if (match) {
           try {
-            const { finalLinks, isMovie } = await withTimeout(getDownloadLinks(match.url), 14000, { finalLinks:[], isMovie:true });
+            const { finalLinks, isMovie } = await withTimeout(getDownloadLinks(match.url), slowBudget, { finalLinks:[], isMovie:true });
             let filtered = finalLinks;
             if (!isMovie && en !== null) filtered = finalLinks.filter(l => l.episode === en);
             filtered.slice(0, 20).forEach(l => {
@@ -147,7 +183,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
       }
     })());
 
-    // ── UHDRodeo streams
+    // ── UHDRodeo
     extractionPromises.push((async () => {
       let uhdResults = uhdSearchRes;
       if (!uhdResults.length && meta.year) uhdResults = await withTimeout(searchUHDRodeo(`${meta.title} ${meta.year}`), 5000, []);
@@ -155,7 +191,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         const uhdMatch = bestMatch(meta.title, uhdResults, sn, type);
         if (uhdMatch) {
           try {
-            const uhdLinks = await withTimeout(getUHDRodeoLinks(uhdMatch.url), 10000, []);
+            const uhdLinks = await withTimeout(getUHDRodeoLinks(uhdMatch.url), slowBudget, []);
             uhdLinks.slice(0, 12).forEach(l => {
               const q = typeof l.quality === 'number' ? l.quality : parseInt(l.quality) || 0;
               const label = streamLabel('UHDRodeo', q, l);
@@ -166,7 +202,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
       }
     })());
 
-    // ── MoviesDrives streams
+    // ── MoviesDrives
     extractionPromises.push((async () => {
       let mdResults = mdSearchRes;
       if (!mdResults.length && meta.year) mdResults = await withTimeout(searchMoviesDrives(`${meta.title} ${meta.year}`), 6000, []);
@@ -174,7 +210,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
         const mdMatch = bestMatch(meta.title, mdResults, sn, type);
         if (mdMatch) {
           try {
-            const mdLinks = await withTimeout(getMoviesDrivesLinks(mdMatch.url), 14000, []);
+            const mdLinks = await withTimeout(getMoviesDrivesLinks(mdMatch.url), slowBudget, []);
             mdLinks.slice(0, 12).forEach(l => {
               const q = typeof l.quality === 'number' ? l.quality : parseInt(l.quality) || 0;
               const label = streamLabel('MoviesDrives', q, l);
@@ -185,19 +221,39 @@ app.get('/stream/:type/:id.json', async (req, res) => {
       }
     })());
 
-    // ── MWSDb currently provides discovery only; skip extraction because its
-    // stream extractor is intentionally empty. Keeping it in the stream path
-    // wastes request budget and can make Stremio receive no sources.
-
-
-    // Run all extractors concurrently
     await Promise.allSettled(extractionPromises);
+    persist();
+  };
 
-    const streams = buildStreams(allStreams, meta);
-    safeRespond({ streams });
+  try {
+    meta = (await Promise.all([
+      withTimeout(fetchDomain(), 3000),
+      withTimeout(getMeta(imdbId, type), 5000),
+    ]))[1];
+
+    if (!meta) { return safeRespond({ streams: [] }); }
+
+    // Start the FULL extraction (long budget) once per title. The same promise
+    // serves the foreground (raced against TOTAL_BUDGET) and continues running
+    // in the background to warm the cache.
+    let job = inFlight.get(cacheKey);
+    if (!job) {
+      job = runExtraction(BACKGROUND_BUDGET)
+        .catch(e => console.error('[stream-bg]', e.message))
+        .finally(() => inFlight.delete(cacheKey));
+      inFlight.set(cacheKey, job);
+      // Safety net: ensure the background job cannot run forever.
+      setTimeout(() => inFlight.delete(cacheKey), BACKGROUND_BUDGET + 5000);
+    }
+
+    // Respond as soon as EITHER the job finishes OR the foreground deadline
+    // fires (whichever comes first). The deadlineTimer handles the timeout
+    // case; here we handle fast completion.
+    await job;
+    safeRespond({ streams: persist() });
   } catch (e) {
     console.error('[stream]', e.message);
-    safeRespond({ streams: [] });
+    safeRespond({ streams: buildStreams(allStreams, meta) });
   }
 });
 
@@ -416,7 +472,7 @@ app.get('/livetest', async (req, res) => {
         const mdMatch = bestMatch('Superman', mdResults, null, 'movie');
         out.steps.moviesdrives_match = mdMatch ? { title: mdMatch.title, url: mdMatch.url } : null;
         if (mdMatch) {
-          const mdLinks = await withTimeout(getMoviesDrivesLinks(mdMatch.url), 12000, []);
+          const mdLinks = await withTimeout(getMoviesDrivesLinks(mdMatch.url), 60000, []);
           out.steps.moviesdrives_streams = mdLinks.length;
           out.steps.moviesdrives_stream_sample = mdLinks.slice(0, 3).map(l => ({ source: l.source, quality: l.quality, url: String(l.url || '').substring(0, 120) }));
         }

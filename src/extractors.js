@@ -753,11 +753,16 @@ async function mdriveLolExtractor(url, referer) {
     );
     directResults.forEach(r => { if (r.status === 'fulfilled' && r.value.length) out.push(...r.value); });
 
+    // HubCloud is the only host that yields links for most titles, but it sits
+    // behind a Cloudflare challenge that only FlareSolverr can solve (~30-45s).
+    // Resolve these serially with a budget above the solve time so the result
+    // can complete and be cached for subsequent requests. A 5s budget here
+    // guaranteed 0 streams.
     if (!out.length && hubcloudFallback.length) {
-      const hubResults = await Promise.allSettled(
-        hubcloudFallback.map(href => withTimeout(loadExtractor(href, url), 5000, []))
-      );
-      hubResults.forEach(r => { if (r.status === 'fulfilled' && r.value.length) out.push(...r.value); });
+      for (const href of hubcloudFallback) {
+        const links = await withTimeout(loadExtractor(href, url), 48000, []);
+        if (links.length) { out.push(...links); break; }
+      }
     }
 
     const seen = new Set();
