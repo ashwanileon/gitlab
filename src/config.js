@@ -8,7 +8,6 @@ const agent = new https.Agent({ rejectUnauthorized: false, keepAlive: true });
 
 const CONFIG = {
   MAIN_URL: 'https://new1.hdhub4u.limo',
-  BACKUP_URL: 'https://hdhub4u.glass',
   FOURTH_K_URL: 'https://4khdhub.link',
   EXTRAFLIX_URL: 'https://e3.extraflix.mobi',
   MWSDB_URL: 'https://mwsdb.vercel.app',
@@ -43,22 +42,55 @@ const HEADERS = {
   'Referer': `${CONFIG.MAIN_URL}/`,
 };
 
+// Strip a trailing slash from a resolved domain value.
+function trimSlash(u) {
+  return typeof u === 'string' && u.endsWith('/') ? u.slice(0, -1) : u;
+}
+
+// Pick the first matching key from the domains.json payload (keys vary in case).
+function pickDomain(data, keys) {
+  for (const k of keys) {
+    if (data[k] && typeof data[k] === 'string' && data[k].startsWith('http')) {
+      return trimSlash(data[k]);
+    }
+  }
+  return null;
+}
+
 async function fetchDomain() {
   return cache.getOrSet('domain', async () => {
     try {
       const { data } = await axios.get(CONFIG.DOMAINS_URL, { httpsAgent: agent, timeout: 5000 });
-      const domain =
-        data['HDHub4u'] || data['HDHUB4u'] || data['hdhub4u'] ||
-        data['HDHub4U'] || data['HDHUB4U'] || data['hdhub4U'] ||
-        data['hdhub4u.limo'] || null;
-      if (domain) {
-        const d = domain.endsWith('/') ? domain.slice(0,-1) : domain;
-        CONFIG.MAIN_URL = d;
+
+      const main = pickDomain(data, [
+        'HDHub4u', 'HDHUB4u', 'hdhub4u', 'HDHub4U', 'HDHUB4U', 'hdhub4U', 'hdhub4u.limo',
+      ]);
+      if (main) {
+        CONFIG.MAIN_URL = main;
         HEADERS.Referer = CONFIG.MAIN_URL + '/';
-        console.log('[domain] resolved:', CONFIG.MAIN_URL);
       }
+
+      const fourK = pickDomain(data, ['4khdhub', '4kHDHub', '4KHDHub']);
+      if (fourK) CONFIG.FOURTH_K_URL = fourK;
+
+      const md = pickDomain(data, ['moviesdrive', 'moviesdrives', 'MoviesDrive']);
+      if (md) CONFIG.MOVIESDRIVES_URL = md;
+
+      const uhd = pickDomain(data, ['UHDMovies', 'uhdmovies', 'UHDMOVIES']);
+      if (uhd) CONFIG.UHDMOVIES_URL = uhd;
+
+      // hubcloud TLD rotates often — promote the resolved one to the front of the list
+      const hub = pickDomain(data, ['hubcloud', 'HubCloud', 'HUBCLOUD']);
+      if (hub) {
+        try {
+          const host = new URL(hub).hostname;
+          CONFIG.HUB_CLOUD_DOMAINS = [host, ...CONFIG.HUB_CLOUD_DOMAINS.filter(d => d !== host)];
+        } catch (_) {}
+      }
+
+      console.log('[domain] resolved:', CONFIG.MAIN_URL, '| 4k:', CONFIG.FOURTH_K_URL, '| md:', CONFIG.MOVIESDRIVES_URL, '| uhd:', CONFIG.UHDMOVIES_URL);
     } catch (e) {
-      console.error('[domain] fetch failed:', e.message, '— using hardcoded fallback');
+      console.error('[domain] fetch failed:', e.message, '— using hardcoded fallbacks');
     }
     return CONFIG.MAIN_URL;
   }, 900000); // 15 minutes

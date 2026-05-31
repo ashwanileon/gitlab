@@ -8,64 +8,55 @@ const { fetchUrlWithBypass } = require('../cloudflare-bypass');
 
 async function searchHDHub4u(query) {
   try {
-    const typesenseResults = await searchViaTypeSense(query);
-    if (typesenseResults.length) return typesenseResults;
-
     const searchUrls = [
       `${CONFIG.MAIN_URL}/?s=${encodeURIComponent(query)}`,
       `${CONFIG.MAIN_URL}/?q=${encodeURIComponent(query)}`,
     ];
 
-    const pages = [];
+    let body = null;
     for (const url of searchUrls) {
       const result = await fetchUrlWithBypass(url);
-      if (result) {
-        pages.push({ status: 'fulfilled', value: result });
-        break;
-      }
+      if (result) { body = result; break; }
     }
+    if (!body) return [];
+
     const results = [];
+    const $ = cheerio.load(body);
 
-    for (const page of pages) {
-      if (page.status !== 'fulfilled') continue;
-      const data = page.value;
-      const $ = cheerio.load(data);
+    $('article, .post, .post-item, .item, [class*="movie"], [class*="series"], a.movie-card').each((_, el) => {
+      const e = $(el);
+      const titleLink = e.find('h2 a, h3 a, h4 a, .entry-title a, .title a, .name a, .movie-title a, .movie-card a').first();
+      const title = titleLink.text().trim() || e.find('h2, h3, h4, .movie-title, .card-title').first().text().trim();
+      const href = titleLink.attr('href') || e.find('a[href]').first().attr('href') || (e.is('a') ? e.attr('href') : '');
 
-      $('article, .post, .post-item, .item, [class*="movie"], [class*="series"], a.movie-card').each((_, el) => {
-        const e = $(el);
-        const titleLink = e.find('h2 a, h3 a, h4 a, .entry-title a, .title a, .name a, .movie-title a, .movie-card a').first();
-        const title = titleLink.text().trim() || e.find('h2, h3, h4, .movie-title, .card-title').first().text().trim();
-        const href = titleLink.attr('href') || e.find('a[href]').first().attr('href') || (e.is('a') ? e.attr('href') : '');
+      if (title && title.length < 300 && href && href.length > 5) {
+        results.push({
+          title: title.replace(/\s+/g, ' '),
+          url: href.startsWith('http') ? href : `${CONFIG.MAIN_URL}${href}`
+        });
+      }
+    });
 
-        if (title && title.length < 300 && href && href.length > 5) {
-          results.push({
-            title: title.replace(/\s+/g, ' '),
-            url: href.startsWith('http') ? href : `${CONFIG.MAIN_URL}${href}`
-          });
-        }
-      });
+    $('a[href*="/"]').each((_, el) => {
+      const e = $(el);
+      const href = e.attr('href') || '';
+      const text = e.text().trim();
+      const full = href.startsWith('http') ? href : `${CONFIG.MAIN_URL}${href}`;
+      const queryTokens = normalizeSearchText(query).split(' ').filter(t => t.length > 2);
+      const haystack = normalizeSearchText(`${text} ${href}`);
 
-      $('a[href*="/"]').each((_, el) => {
-        const e = $(el);
-        const href = e.attr('href') || '';
-        const text = e.text().trim();
-        const full = href.startsWith('http') ? href : `${CONFIG.MAIN_URL}${href}`;
-        const queryTokens = normalizeSearchText(query).split(' ').filter(t => t.length > 2);
-        const haystack = normalizeSearchText(`${text} ${href}`);
-
-        if (
-          (href.includes(CONFIG.MAIN_URL) || href.startsWith('/')) &&
-          (/\/(20\d{2}|20\d{2}-)/.test(href) || /^\/[a-z0-9-]{8,}/.test(href)) &&
-          queryTokens.every(t => haystack.includes(t)) &&
-          !href.includes('?s=') && !href.includes('?q=') &&
-          !href.includes('comment') &&
-          !text.match(/^(next|prev|page|post)\s*\d/i) &&
-          full.startsWith(CONFIG.MAIN_URL)
-        ) {
-          results.push({ title: (text || full.split('/').filter(Boolean).pop()).replace(/\s+/g, ' '), url: full });
-        }
-      });
-    }
+      if (
+        (href.includes(CONFIG.MAIN_URL) || href.startsWith('/')) &&
+        (/\/(20\d{2}|20\d{2}-)/.test(href) || /^\/[a-z0-9-]{8,}/.test(href)) &&
+        queryTokens.every(t => haystack.includes(t)) &&
+        !href.includes('?s=') && !href.includes('?q=') &&
+        !href.includes('comment') &&
+        !text.match(/^(next|prev|page|post)\s*\d/i) &&
+        full.startsWith(CONFIG.MAIN_URL)
+      ) {
+        results.push({ title: (text || full.split('/').filter(Boolean).pop()).replace(/\s+/g, ' '), url: full });
+      }
+    });
 
     const seen = new Set();
     return results.filter(r => {
@@ -76,75 +67,6 @@ async function searchHDHub4u(query) {
   } catch (e) {
     return [];
   }
-}
-
-async function searchViaTypeSense(query) {
-  const typeSenseVariants = [
-    { baseUrl: 'https://search.hdhub4u.glass', path: '/collections/post/documents/search' },
-    { baseUrl: 'https://search.hdhub4u.bond', path: '/collections/post/documents/search' },
-    { baseUrl: 'https://search.hdhub4u.click', path: '/collections/post/documents/search' },
-  ];
-
-  const axiosResults = await Promise.allSettled(
-    typeSenseVariants.map(async (variant) => {
-      const params = {
-        q: query,
-        query_by: 'post_title',
-        per_page: 10,
-        prefix: true,
-      };
-      const { data } = await axios.get(`${variant.baseUrl}${variant.path}`, {
-        params,
-        httpsAgent: agent,
-        timeout: 5000,
-      });
-      if (data && data.hits && data.hits.length) return { variant, data };
-      return null;
-    })
-  );
-
-  for (const r of axiosResults) {
-    if (r.status === 'fulfilled' && r.value && r.value.data) {
-      const parsed = parseTypeSenseResults(r.value.data, query);
-      if (parsed.length) return parsed;
-    }
-  }
-
-  for (const variant of typeSenseVariants) {
-    const params = { q: query, query_by: 'post_title', per_page: 10, prefix: true };
-    const fullUrl = `${variant.baseUrl}${variant.path}?${new URLSearchParams(params).toString()}`;
-    const proxyResult = await fetchUrlWithBypass(fullUrl, {
-      timeout: 25000,
-      headers: { Accept: 'application/json,text/plain,*/*' },
-    });
-    if (proxyResult) {
-      try {
-        const data = JSON.parse(proxyResult);
-        if (data && data.hits && data.hits.length) return parseTypeSenseResults(data, query);
-      } catch (_) {}
-    }
-  }
-
-  return [];
-}
-
-function parseTypeSenseResults(data, query) {
-  const results = data.hits.map(hit => {
-    const doc = hit.document;
-    return {
-      title: doc.post_title || query,
-      url: doc.permalink ? `${CONFIG.MAIN_URL}${doc.permalink}` : '',
-      imdb_id: doc.imdb_id,
-      categories: doc.category,
-    };
-  }).filter(r => r.url);
-
-  const seen = new Set();
-  return results.filter(r => {
-    if (seen.has(r.url)) return false;
-    seen.add(r.url);
-    return true;
-  });
 }
 
 async function findDirectPage(title, year) {
@@ -166,9 +88,8 @@ async function findDirectPage(title, year) {
   for (const s of slugs) {
     const url = s.startsWith('/') ? `${base}${s}` : `${base}/${s}`;
     try {
-      const r = await axios.get(url, { headers: HEADERS, httpsAgent: agent, timeout: 8000 });
-      const body = (r.data || '') + '';
-      if (body.includes('hubcdn') || body.includes('hubdrive') || body.includes('hubcloud') || body.includes('gadgetsweb') || body.includes('pixeldrain')) {
+      const body = await fetchUrlWithBypass(url, { timeout: 12000 });
+      if (body && (body.includes('hubcdn') || body.includes('hubdrive') || body.includes('hubcloud') || body.includes('gadgetsweb') || body.includes('pixeldrain'))) {
         console.log(`[hdhub4u-direct] Found direct URL: ${url.substring(0, 80)}`);
         return url;
       }

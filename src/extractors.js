@@ -180,6 +180,17 @@ function isChallengePage(body) {
   return indicators.some(i => body.includes(i));
 }
 
+// A real hubcloud drive page contains a card-body with download buttons and is
+// several KB. Some live-but-broken TLDs (e.g. hubcloud.ink) return a ~1KB stub
+// with no buttons. Treat those as failures so the resolver keeps trying.
+function isUsableHubCloudPage(html) {
+  if (!html || typeof html !== 'string') return false;
+  if (html.length < 1500) return false;
+  if (isChallengePage(html)) return false;
+  // Must look like an actual drive page (download card / buttons / known hosts).
+  return /card-body|card-header|Download File|FSL Server|S3 Server|10Gbps|pixeldra|hubcloud\.php/i.test(html);
+}
+
 // Fast hubcloud fetch: try direct axios first, then CF Worker proxy fallback
 async function fetchHubCloudPageFast(pageUrl, ref) {
   const navHeaders = hubCloudNavHeaders(ref);
@@ -187,7 +198,7 @@ async function fetchHubCloudPageFast(pageUrl, ref) {
   // Try direct axios (fast — works from residential/VPS IPs)
   try {
     const resp = await axios.get(pageUrl, { headers: navHeaders, httpsAgent: agent, timeout: 8000 });
-    if (resp.data && typeof resp.data === 'string' && resp.data.length > 200 && !isChallengePage(resp.data)) {
+    if (resp.data && isUsableHubCloudPage(resp.data)) {
       return { html: resp.data, headers: navHeaders };
     }
   } catch (_) {}
@@ -196,7 +207,7 @@ async function fetchHubCloudPageFast(pageUrl, ref) {
   try {
     const { fetchViaCfProxy } = require('./cf-proxy');
     const proxyHtml = await fetchViaCfProxy(pageUrl, { headers: navHeaders });
-    if (proxyHtml && typeof proxyHtml === 'string' && proxyHtml.length > 200 && !isChallengePage(proxyHtml)) {
+    if (proxyHtml && isUsableHubCloudPage(proxyHtml)) {
       return { html: proxyHtml, headers: navHeaders };
     }
   } catch (_) {}
@@ -205,7 +216,7 @@ async function fetchHubCloudPageFast(pageUrl, ref) {
   try {
     const { trySystemCurl } = require('./cloudflare-bypass');
     const curlHtml = await trySystemCurl(pageUrl, { timeout: 15000 });
-    if (curlHtml && typeof curlHtml === 'string' && curlHtml.length > 200 && !isChallengePage(curlHtml)) {
+    if (curlHtml && isUsableHubCloudPage(curlHtml)) {
       return { html: curlHtml, headers: navHeaders };
     }
   } catch (_) {}
@@ -266,18 +277,7 @@ async function resolveHubCloudUrl(url, referer) {
       try { workingHubCloudDomain = new URL(r.value.finalUrl).hostname; } catch (_) {}
       return r.value;
     }
-  }    // Phase 2: Skip FlareSolverr for hubcloud — all TLDs are returning 530 (origin unreachable)
-  // or 403 (Cloudflare block). FlareSolverr can't bypass a dead origin server.
-  // Re-enable Phase 2 if hubcloud domains come back to life.
-  /*
-  const fsResult = await fetchHubCloudPageWithFS(url, referer);
-  if (fsResult) {
-    try { workingHubCloudDomain = new URL(url).hostname; } catch (_) {}
-    return { html: fsResult.html, finalUrl: url };
   }
-  */
-
-  return { html: null };
 
   return { html: null };
 }
@@ -557,9 +557,10 @@ async function unblockedGamesExtractor(url) {
         }
       } catch (_) {}
     }
-    return [{ source: 'UnblockedGames', quality: 'Unknown', url }];
+    // Could not resolve a real video URL — do NOT leak the page URL to Stremio.
+    return [];
   } catch (e) {
-    return [{ source: 'UnblockedGames', quality: 'Unknown', url }];
+    return [];
   }
 }
 

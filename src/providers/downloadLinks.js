@@ -113,7 +113,7 @@ async function getDownloadLinks(mediaUrl) {
       const text = $(el).text().trim();
 
       if (
-        href && href.startsWith('http') && !href.includes(CONFIG.MAIN_URL) && !href.includes(CONFIG.BACKUP_URL) && !href.includes('.zip') &&
+        href && href.startsWith('http') && !href.includes(CONFIG.MAIN_URL) && !href.includes('.zip') &&
         (
           href.includes('hubcdn') || href.includes('hubcloud') || href.includes('hubdrive') ||
           href.includes('drivehub') || href.includes('linkshub') || href.includes('gadgetsweb') ||

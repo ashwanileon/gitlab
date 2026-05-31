@@ -158,10 +158,43 @@ function streamFilename(url, name, title, year) {
   return `${titleSlug}${year ? '.' + year : ''}${quality ? '.' + quality + 'p' : ''}.${ext}`;
 }
 
+// Hosts that serve HTML wrapper/landing pages, never a directly playable file.
+const WRAPPER_HOST_PATTERNS = [
+  'hubcloud', 'hubdrive', 'drivehub', 'linkshub', 'hubcdn', 'hdstream4u',
+  'hubstream', 'gadgetsweb', 'gamerxyt', 'mdrive.lol', 'mdrive.ink',
+  'unblockedgames', 'techyboy4u', 'extralink', 'gdflix', 'linkrit',
+];
+
+// Return true only if the URL is something Stremio can actually play:
+// a direct media file, or a known direct-download / streaming endpoint.
+function isPlayableUrl(url) {
+  if (!url || typeof url !== 'string' || !url.startsWith('http')) return false;
+  if (url.includes('.zip')) return false;
+  if (url.includes('search-recover.php')) return false;
+  let host;
+  try { host = new URL(url).hostname.toLowerCase(); } catch (_) { return false; }
+
+  // Direct media file extension is always playable.
+  if (/\.(mp4|mkv|m3u8|webm|avi|mov)(?:$|[?#])/i.test(url)) return true;
+
+  // Known direct-download / CDN endpoints that stream without an HTML page.
+  if (host.includes('pixeldrain') && /\/api\/file\//.test(url)) return true;
+  if (host.includes('workers.dev')) return true;
+  if (host.includes('googleusercontent') || host.includes('googlevideo')) return true;
+  if (host.includes('streamtape') && /get_video/.test(url)) return true;
+
+  // Anything on a known wrapper host is an HTML page, not a stream.
+  if (WRAPPER_HOST_PATTERNS.some(p => host.includes(p) || url.includes(p))) return false;
+
+  // Unknown host with no media extension: reject to avoid "not supported".
+  return false;
+}
+
 function buildStreams(allStreams, meta, maxPerSource = 2) {
   const groups = {};
   for (const s of allStreams) {
     if (!s.url || s.url.includes('.zip')) continue;
+    if (!isPlayableUrl(s.url)) continue;
     const q = parseInt(s.name.match(/(\d+)p/)?.[1]||0);
     if (q > 0 && q < 1080) continue;
     const nameStr = s.name || '';
@@ -231,6 +264,6 @@ function bestMatch(title, results, season, type) {
 module.exports = {
   rot13, atob, btoa, formatBytes, displaySize, cleanHostLabel,
   releaseTags, languageTags, streamLabel, cleanTitle,
-  normalizeSearchText, streamFilename, buildStreams,
+  normalizeSearchText, streamFilename, buildStreams, isPlayableUrl,
   withTimeout, slugify, bestMatch, TAG_ORDER, LANG_DISPLAY
 };
