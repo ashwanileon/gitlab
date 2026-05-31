@@ -237,18 +237,19 @@ async function tryCurlImpersonate(url, options = {}) {
 async function tryFlareSolverr(url, options = {}) {
   if (!FLARESOLVERR_ENDPOINT) return null;
 
+  const timeout = Math.max(1000, Math.min(options.timeout || FS_TIMEOUT, FS_TIMEOUT));
   const cacheKey = `flaresolverr:${url}`;
   return cache.getOrSet(cacheKey, () => withFSLock(async () => {
     try {
       const payload = {
         cmd: 'request.get',
         url,
-        maxTimeout: 30000,
+        maxTimeout: timeout,
       };
       const response = await axios.post(`${FLARESOLVERR_ENDPOINT}/v1`, payload, {
         headers: { 'Content-Type': 'application/json' },
         httpsAgent: agent,
-        timeout: options.timeout || FS_TIMEOUT,
+        timeout: timeout + 1000,
       });
       const result = response.data;
       if (result && result.status === 'ok' && result.solution) {
@@ -334,11 +335,17 @@ async function fetchUrlWithBypass(url, options = {}) {
   }
 
   // Method 3: curl-impersonate (if installed)
-  result = await tryCurlImpersonate(url, options);
+  result = await tryCurlImpersonate(url, { ...options, timeout: Math.min(remaining(), CURL_TIMEOUT) });
   if (result) { recordSuccess(host); return result; }
 
+  if (remaining() <= 0) {
+    console.log(`[bypass] Budget exhausted before FlareSolverr for ${url.substring(0, 60)}`);
+    recordFailure(host);
+    return null;
+  }
+
   // Method 4: FlareSolverr (optional, solves real JS challenges)
-  result = await tryFlareSolverr(url, options);
+  result = await tryFlareSolverr(url, { ...options, timeout: Math.min(remaining(), FS_TIMEOUT) });
   if (result) { recordSuccess(host); return result; }
 
   recordFailure(host);

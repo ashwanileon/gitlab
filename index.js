@@ -424,7 +424,16 @@ app.get('/livetest', async (req, res) => {
     try {
       const mdResults = await searchMoviesDrives('Superman');
       out.steps.moviesdrives_results = mdResults.length;
-      out.fixes.push(`${mdResults.length ? '✅' : '❌'} MoviesDrives search: ${mdResults.length} results`);
+      if (mdResults.length) {
+        const mdMatch = bestMatch('Superman', mdResults, null, 'movie');
+        out.steps.moviesdrives_match = mdMatch ? { title: mdMatch.title, url: mdMatch.url } : null;
+        if (mdMatch) {
+          const mdLinks = await withTimeout(getMoviesDrivesLinks(mdMatch.url), 12000, []);
+          out.steps.moviesdrives_streams = mdLinks.length;
+          out.steps.moviesdrives_stream_sample = mdLinks.slice(0, 3).map(l => ({ source: l.source, quality: l.quality, url: String(l.url || '').substring(0, 120) }));
+        }
+      }
+      out.fixes.push(`${mdResults.length ? '✅' : '❌'} MoviesDrives search: ${mdResults.length} results${out.steps.moviesdrives_streams !== undefined ? `, streams: ${out.steps.moviesdrives_streams}` : ''}`);
     } catch (e) { out.steps.moviesdrives_error = e.message; }
 
     try {

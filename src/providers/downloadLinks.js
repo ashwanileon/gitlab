@@ -15,7 +15,11 @@ async function getDownloadLinks(mediaUrl) {
   } catch (e) {
     try {
       const { fetchUrlWithBypass } = require('../cloudflare-bypass');
-      const bypassResult = await fetchUrlWithBypass(mediaUrl, { timeout: 30000 });
+      // Stream requests have a hard Stremio-facing deadline. Detail pages that
+      // cannot be bypassed quickly should fail fast so other providers can still
+      // return playable links instead of being blocked by a 30–60s FlareSolverr
+      // attempt.
+      const bypassResult = await fetchUrlWithBypass(mediaUrl, { timeout: 8000, budget: 10000 });
       if (bypassResult) {
         data = bypassResult;
       }
