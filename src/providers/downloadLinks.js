@@ -183,9 +183,12 @@ async function getDownloadLinks(mediaUrl) {
           link.url.includes('drivehub') || link.url.includes('linkshub') || link.url.includes('hubcdn') ||
           link.url.includes('extralink')
         ) {
-          const resolveMs = mediaUrl.includes('extraflix.')
-            ? (CONFIG.IS_SERVERLESS ? 20000 : 15000)
-            : (mediaUrl.includes('4khdhub.link') && CONFIG.IS_SERVERLESS ? 15000 : (CONFIG.IS_SERVERLESS ? 10000 : 5000));
+          const isSlowHubcloud = link.url.includes('hubcloud') || link.url.includes('hubcdn');
+          const resolveMs = isSlowHubcloud && CONFIG.IS_SERVERLESS
+            ? 5000
+            : mediaUrl.includes('extraflix.')
+              ? (CONFIG.IS_SERVERLESS ? 12000 : 15000)
+              : (mediaUrl.includes('4khdhub.link') && CONFIG.IS_SERVERLESS ? 8000 : (CONFIG.IS_SERVERLESS ? 7000 : 5000));
           const resolved = await withTimeout(loadExtractor(link.url, mediaUrl), resolveMs, []);
           if (resolved && resolved.length) {
             return resolved.map(r => ({

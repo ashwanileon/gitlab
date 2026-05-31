@@ -117,7 +117,8 @@ async function getMoviesDrivesLinks(mediaUrl) {
 
     const resolveResults = await Promise.allSettled(uniquePairs.map(async (pair) => {
       try {
-        const resolved = await withTimeout(loadExtractor(pair.url, mediaUrl), 20000, []);
+        const isSlowHubcloud = pair.url.includes('hubcloud') || pair.url.includes('hubcdn');
+        const resolved = await withTimeout(loadExtractor(pair.url, mediaUrl), isSlowHubcloud ? 5000 : 9000, []);
         if (resolved && resolved.length) {
           return resolved.map(link => ({
             ...link,

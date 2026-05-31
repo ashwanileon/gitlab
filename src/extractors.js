@@ -694,24 +694,82 @@ async function mdriveLolExtractor(url, referer) {
       return [];
     }
 
+    // Also scan the raw page for direct playable URLs. Some mdrive archive
+    // pages expose pixeldrain / worker / video URLs in scripts instead of <a>
+    // tags, while the visible anchors point to HubCloud pages that are blocked
+    // from Koyeb. Returning these first lets Stremio get streams before the
+    // global deadline expires.
+    const inlineUrls = (bestData.match(/https?:\/\/[^\s"'<>)]+/g) || [])
+      .map(u => u.replace(/\\\//g, '/').replace(/[),.;]+$/g, ''))
+      .filter(href => {
+        try {
+          const host = new URL(href).hostname.toLowerCase();
+          return (
+            host.includes('pixeldrain') ||
+            host.includes('workers.dev') ||
+            host.includes('googleusercontent') ||
+            host.includes('googlevideo') ||
+            host.includes('streamtape') ||
+            /\.(mp4|mkv|m3u8|webm|avi|mov)(?:$|[?#])/i.test(href)
+          );
+        } catch (_) { return false; }
+      });
+    candidates.push(...inlineUrls);
+
     // Resolve reachable hosts first: pixeldrain and direct video files work from
-    // datacenter IPs, whereas hubcloud often does not. Try those before hubcloud.
+    // datacenter IPs, whereas hubcloud often does not. HubCloud is kept as a
+    // last resort with a short timeout so it cannot consume the whole Stremio
+    // request window.
     const priority = (h) => {
-      if (h.includes('pixeldrain') || /\.(mp4|mkv|m3u8)(?:$|\?)/i.test(h)) return 0;
-      if (h.includes('streamtape') || h.includes('drivehub') || h.includes('hubdrive')) return 1;
-      if (h.includes('hubcloud') || h.includes('hubcdn')) return 3;
-      return 2;
+      if (h.includes('pixeldrain') || /\.(mp4|mkv|m3u8|webm|avi|mov)(?:$|[?#])/i.test(h)) return 0;
+      if (h.includes('workers.dev') || h.includes('googleusercontent') || h.includes('googlevideo')) return 1;
+      if (h.includes('streamtape') || h.includes('drivehub') || h.includes('hubdrive')) return 2;
+      if (h.includes('hubcloud') || h.includes('hubcdn')) return 9;
+      return 4;
     };
     const ordered = [...new Set(candidates)].sort((a, b) => priority(a) - priority(b));
 
-    const results = await Promise.allSettled(
-      ordered.slice(0, 3).map(href => withTimeout(loadExtractor(href, url), 15000, []))
-    );
     const out = [];
-    results.forEach(r => { if (r.status === 'fulfilled' && r.value.length) out.push(...r.value); });
-    console.log(`[mdrive] ${out.length} streams from ${url.substring(0, 60)}`);
-    return out;
+    const directFirst = ordered.filter(href => priority(href) < 9).slice(0, 6);
+    const hubcloudFallback = ordered.filter(href => priority(href) >= 9).slice(0, 2);
+
+    const directResults = await Promise.allSettled(
+      directFirst.map(href => withTimeout(loadExtractor(href, url), 7000, []))
+    );
+    directResults.forEach(r => { if (r.status === 'fulfilled' && r.value.length) out.push(...r.value); });
+
+    if (!out.length && hubcloudFallback.length) {
+      const hubResults = await Promise.allSettled(
+        hubcloudFallback.map(href => withTimeout(loadExtractor(href, url), 5000, []))
+      );
+      hubResults.forEach(r => { if (r.status === 'fulfilled' && r.value.length) out.push(...r.value); });
+    }
+
+    const seen = new Set();
+    const unique = out.filter(s => {
+      if (!s?.url || seen.has(s.url)) return false;
+      seen.add(s.url);
+      return true;
+    });
+    console.log(`[mdrive] ${unique.length} streams from ${url.substring(0, 60)}`);
+    return unique;
   } catch (e) { console.error(`[mdrive] Error: ${e.message}`); return []; }
+}
+
+function isDirectPlayableUrl(url) {
+  if (!url || typeof url !== 'string' || !url.startsWith('http')) return false;
+  if (url.includes('.zip') || url.includes('search-recover.php')) return false;
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return (
+      /\.(mp4|mkv|m3u8|webm|avi|mov)(?:$|[?#])/i.test(url) ||
+      (host.includes('pixeldrain') && /\/api\/file\//.test(url)) ||
+      host.includes('workers.dev') ||
+      host.includes('googleusercontent') ||
+      host.includes('googlevideo') ||
+      (host.includes('streamtape') && /get_video/.test(url))
+    );
+  } catch (_) { return false; }
 }
 
 async function loadExtractor(url, referer) {
@@ -738,7 +796,8 @@ async function loadExtractor(url, referer) {
     if (host.includes('gdflix'))     return [];
     if (host.includes('linkrit'))    return [];
     if (host.includes('extralink'))  return extralinkInkExtractor(url, referer);
-    return [{ source: host.replace(/^www\./,''), quality:'Unknown', url }];
+    if (isDirectPlayableUrl(url)) return [{ source: host.replace(/^www\./,''), quality:'Unknown', url }];
+    return [];
   } catch (_) { return []; }
 }
 
