@@ -89,7 +89,6 @@ async function getMoviesDrivesLinks(mediaUrl) {
         let quality = 0;
         const qm = context.match(/(\d{3,4})\s*p/i);
         if (qm) quality = parseInt(qm[1]);
-        if (quality > 0 && quality < 1080) continue;
         const sizeMatch = context.match(/\[?([\d.]+\s*(?:GB|MB|KB))\]?/i);
         linkPairs.push({ url: href, quality, size: sizeMatch ? sizeMatch[1] : '', heading });
       }
@@ -104,7 +103,6 @@ async function getMoviesDrivesLinks(mediaUrl) {
             let quality = 0;
             const qm = parentText.match(/(\d{3,4})\s*p/i);
             if (qm) quality = parseInt(qm[1]);
-            if (quality > 0 && quality < 1080) return;
             const sizeMatch = parentText.match(/\[?([\d.]+\s*(?:GB|MB|KB))\]?/i);
             linkPairs.push({ url: href, quality, size: sizeMatch ? sizeMatch[1] : '', heading: parentText });
           }
@@ -112,13 +110,52 @@ async function getMoviesDrivesLinks(mediaUrl) {
       });
     }
 
+    // Layout fallback: MoviesDrives changes markup often. Do not depend only on
+    // h5/h5 pairs; collect every plausible external hoster URL from anchors and
+    // inline scripts, then infer quality/size from nearby text.
+    const addPair = (href, context = '') => {
+      if (!href || !href.startsWith('http')) return;
+      if (href.includes('moviesdrives.my') || href.includes('facebook') || href.includes('twitter') || href.includes('pinterest') || href.includes('imdb') || href.includes('.zip')) return;
+      if (!/(hubcloud|hubloud|gdflix|mdrive\.lol|archive\/\d+|hubdrive|hubcdn|pixeldrain|streamtape|hdstream4u|drivehub|linkshub|workers\.dev|googleusercontent|googlevideo|\.mp4|\.mkv|\.m3u8|\.webm)/i.test(href)) return;
+      let quality = 0;
+      if (/\b4K\b|\b2160\b|2160p/i.test(context)) quality = 2160;
+      else {
+        const qm = context.match(/(\d{3,4})\s*p/i);
+        if (qm) quality = parseInt(qm[1]);
+      }
+      const sizeMatch = context.match(/\[?([\d.]+\s*(?:GB|MB|KB))\]?/i);
+      linkPairs.push({ url: href, quality, size: sizeMatch ? sizeMatch[1] : '', heading: context.substring(0, 240) });
+    };
+
+    $('a[href]').each((_, el) => {
+      const href = $(el).attr('href') || '';
+      const context = $(el).closest('h5, p, div, li, section, article').text().trim().replace(/\s+/g, ' ');
+      addPair(href, context || $(el).text().trim().replace(/\s+/g, ' '));
+    });
+
+    const inlineUrls = (String(data).match(/https?:\\?\/\\?\/[^\s"'<>)]+/g) || [])
+      .map(u => u.replace(/\\\//g, '/').replace(/[),.;]+$/g, ''));
+    inlineUrls.forEach(href => {
+      const idx = String(data).indexOf(href);
+      const context = idx >= 0 ? String(data).slice(Math.max(0, idx - 500), idx + 500).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ') : '';
+      addPair(href, context);
+    });
+
     const seen = new Set();
     const uniquePairs = linkPairs.filter(p => { if (seen.has(p.url)) return false; seen.add(p.url); return true; });
 
-    const resolveResults = await Promise.allSettled(uniquePairs.map(async (pair) => {
+    const priority = (url) => {
+      if (/pixeldrain|\.mp4|\.mkv|\.m3u8|\.webm|workers\.dev|googleusercontent|googlevideo/i.test(url)) return 0;
+      if (/streamtape|drivehub|hubdrive|linkshub|mdrive\.lol|gdflix|hubloud/i.test(url)) return 1;
+      if (/hubcloud|hubcdn/i.test(url)) return 9;
+      return 4;
+    };
+    uniquePairs.sort((a, b) => priority(a.url) - priority(b.url));
+
+    const resolveOne = async (pair) => {
       try {
-        const isSlowHubcloud = pair.url.includes('hubcloud') || pair.url.includes('hubcdn');
-        const resolved = await withTimeout(loadExtractor(pair.url, mediaUrl), isSlowHubcloud ? 5000 : 9000, []);
+        const isSlowHubcloud = /(hubcloud|hubloud|hubcdn|mdrive\.lol|gdflix)/i.test(pair.url);
+        const resolved = await withTimeout(loadExtractor(pair.url, mediaUrl), isSlowHubcloud ? 7000 : 8000, []);
         if (resolved && resolved.length) {
           return resolved.map(link => ({
             ...link,
@@ -132,10 +169,19 @@ async function getMoviesDrivesLinks(mediaUrl) {
         }
         return [];
       } catch (_) { return []; }
-    }));
+    };
 
     const allStreamLinks = [];
-    resolveResults.forEach(r => { if (r.status === 'fulfilled') allStreamLinks.push(...r.value); });
+    const fastPairs = uniquePairs.filter(p => priority(p.url) < 9).slice(0, 10);
+    const fastResults = await Promise.allSettled(fastPairs.map(resolveOne));
+    fastResults.forEach(r => { if (r.status === 'fulfilled') allStreamLinks.push(...r.value); });
+
+    if (!allStreamLinks.length) {
+      const hubResults = await Promise.allSettled(uniquePairs.filter(p => priority(p.url) >= 9).slice(0, 2).map(resolveOne));
+      hubResults.forEach(r => { if (r.status === 'fulfilled') allStreamLinks.push(...r.value); });
+    }
+
+    console.log(`[moviesdrives] ${uniquePairs.length} candidate links, ${allStreamLinks.length} resolved streams from ${mediaUrl.substring(0, 80)}`);
     const seenUrls = new Set();
     return allStreamLinks.filter(l => { if (!l.url || seenUrls.has(l.url)) return false; seenUrls.add(l.url); return true; });
   } catch (e) { return []; }

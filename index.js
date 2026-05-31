@@ -185,22 +185,10 @@ app.get('/stream/:type/:id.json', async (req, res) => {
       }
     })());
 
-    // ── MWSDb streams (direct extraction, no getDownloadLinks needed)
-    extractionPromises.push((async () => {
-      if (mwsResults && mwsResults.length) {
-        const match = bestMatch(meta.title, mwsResults, sn, type);
-        if (match) {
-          try {
-            const mwsLinks = await withTimeout(getMWSDbStreams(match.url, en), 10000, []);
-            mwsLinks.slice(0, 10).forEach(l => {
-              const q = typeof l.quality === 'number' ? l.quality : parseInt(l.quality) || 0;
-              const name = q > 0 ? `MWSDb ${q}p` : 'MWSDb';
-              allStreams.push({ name, title: l.source || 'MWSDb', url: l.url });
-            });
-          } catch (e) { console.error('[mwsResult]', e.message); }
-        }
-      }
-    })());
+    // ── MWSDb currently provides discovery only; skip extraction because its
+    // stream extractor is intentionally empty. Keeping it in the stream path
+    // wastes request budget and can make Stremio receive no sources.
+
 
     // Run all extractors concurrently
     await Promise.allSettled(extractionPromises);

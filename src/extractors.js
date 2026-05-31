@@ -212,7 +212,7 @@ async function fetchHubCloudPageFast(pageUrl, ref) {
     }
   } catch (_) {}
 
-  // Last resort: try system curl with Chrome fingerprint (bypasses basic CF)
+  // Last resort (fast methods): system curl with Chrome fingerprint (bypasses basic CF)
   try {
     const { trySystemCurl } = require('./cloudflare-bypass');
     const curlHtml = await trySystemCurl(pageUrl, { timeout: 15000 });
@@ -220,6 +220,21 @@ async function fetchHubCloudPageFast(pageUrl, ref) {
       return { html: curlHtml, headers: navHeaders };
     }
   } catch (_) {}
+
+  // Final fallback: FlareSolverr (headless browser). HubCloud serves an
+  // interactive Cloudflare JS challenge that none of the fetch-based methods
+  // above can solve from a datacenter IP (e.g. Koyeb). This is the only method
+  // that solves it, so it is required for HubCloud to resolve in production.
+  // Skipped automatically when FLARESOLVERR_ENDPOINT is not configured.
+  if (process.env.FLARESOLVERR_ENDPOINT) {
+    try {
+      const { tryFlareSolverr } = require('./cloudflare-bypass');
+      const fsHtml = await tryFlareSolverr(pageUrl, { timeout: 30000 });
+      if (fsHtml && isUsableHubCloudPage(fsHtml)) {
+        return { html: fsHtml, headers: navHeaders };
+      }
+    } catch (_) {}
+  }
 
   return null;
 }
