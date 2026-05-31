@@ -36,8 +36,17 @@ Install in Stremio via `http://localhost:3000/manifest.json`.
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `CF_WORKER_URL` | Recommended | URL of the Cloudflare Worker proxy (see below). Primary Cloudflare bypass. |
+| `FLARESOLVERR_ENDPOINT` | Optional | Base URL of an external FlareSolverr (e.g. `http://<vm-ip>:8191`) on an always-on box such as an Oracle Cloud Always-Free VM. Solves challenge-mode Cloudflare sites (hubcloud, 4khdhub, hdhub4u) that a fetch proxy cannot. Used as the last-resort bypass method. |
 | `TMDB_KEY` | Optional | TMDB API key used as a metadata fallback when Cinemeta is unavailable. |
 | `PORT` | Optional | Defaults to `3000`. |
+
+### Challenge-mode sources (hubcloud / 4khdhub / hdhub4u)
+
+The CF Worker proxy defeats IP-based blocking but cannot solve interactive
+Cloudflare JS challenges (Turnstile). Sites in challenge mode therefore need a
+headless-browser solver. Run **FlareSolverr** on a free always-on VM (Oracle
+Cloud Always-Free) and set `FLARESOLVERR_ENDPOINT` to its URL. The addon then
+uses it as the final bypass step, serialized so a small VM is not overwhelmed.
 
 ## Cloudflare bypass (the free, permanent fix)
 

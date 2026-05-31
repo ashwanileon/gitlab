@@ -17,7 +17,10 @@ app.use((req, res, next) => {
   next();
 });
 
-const TOTAL_BUDGET = CONFIG.IS_SERVERLESS ? 140000 : 19000;
+// Stremio typically abandons a stream request after ~20-30s, so keep the
+// overall deadline well under that. Blocked sources fail fast via the
+// circuit breaker, so this budget mainly bounds the slowest live extraction.
+const TOTAL_BUDGET = CONFIG.IS_SERVERLESS ? 22000 : 19000;
 
 app.get('/manifest.json', (_, res) => res.json({
   id: 'community.httpstreams.stremio',
@@ -66,10 +69,10 @@ app.get('/stream/:type/:id.json', async (req, res) => {
     // All providers use their own internal Cloudflare bypass (CF Worker → curl → curl-impersonate)
     // The bypass module handles failures gracefully — no need to gate providers here
     const searchPromises = [
-      withTimeout(searchHDHub4u(meta.title), 35000, []),
-      withTimeout(search4KHDHub4u(meta.title), 35000, []),
-      withTimeout(searchExtraFlix(meta.title), 35000, []),
-      withTimeout(searchUHDRodeo(meta.title), 15000, []),
+      withTimeout(searchHDHub4u(meta.title), 9000, []),
+      withTimeout(search4KHDHub4u(meta.title), 9000, []),
+      withTimeout(searchExtraFlix(meta.title), 12000, []),
+      withTimeout(searchUHDRodeo(meta.title), 12000, []),
       withTimeout(searchMoviesDrives(meta.title), 8000, []),
       withTimeout(searchMWSDb(meta.title), 8000, []),
     ];

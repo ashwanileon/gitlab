@@ -71,24 +71,18 @@ async function searchHDHub4u(query) {
 
 async function findDirectPage(title, year) {
   const base = CONFIG.MAIN_URL.replace(/\/$/, '');
-  const slugs = [];
   const t = slugify(title);
-  if (year) slugs.push(`${t}-${year}-hindi-webrip-full-movie/`);
-  if (year) slugs.push(`${t}-${year}-hindi-full-movie/`);
-  if (year) slugs.push(`${t}-${year}-full-movie/`);
+  // Probe only the two most likely slugs. The bypass circuit breaker will
+  // short-circuit further attempts when the origin is blocked, so we avoid
+  // spending 20s+ spraying many slug variants on a dead origin.
+  const slugs = [];
   if (year) slugs.push(`${t}-${year}/`);
-  if (year) slugs.push(`${t}-${year}-webrip/`);
-  if (year) slugs.push(`${t}-${year}-web-dl/`);
-  if (year) slugs.push(`${t}-${year}-dual-audio/`);
-  slugs.push(`${t}-full-movie/`);
-  slugs.push(`${t}-hindi-full-movie/`);
   slugs.push(`${t}/`);
-  slugs.push(`${t}-hindi/`);
 
   for (const s of slugs) {
-    const url = s.startsWith('/') ? `${base}${s}` : `${base}/${s}`;
+    const url = `${base}/${s}`;
     try {
-      const body = await fetchUrlWithBypass(url, { timeout: 12000 });
+      const body = await fetchUrlWithBypass(url, { timeout: 8000 });
       if (body && (body.includes('hubcdn') || body.includes('hubdrive') || body.includes('hubcloud') || body.includes('gadgetsweb') || body.includes('pixeldrain'))) {
         console.log(`[hdhub4u-direct] Found direct URL: ${url.substring(0, 80)}`);
         return url;

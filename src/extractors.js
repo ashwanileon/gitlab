@@ -254,7 +254,9 @@ async function resolveHubCloudUrl(url, referer) {
     const hubIdx = baseParts.findIndex(p => p === 'hubcloud');
     if (hubIdx !== -1 && hubIdx < baseParts.length - 1) {
       const { CONFIG } = require('./config');
-      for (const domain of CONFIG.HUB_CLOUD_DOMAINS) {
+      // Only the first two variants (the live domain is promoted to the front
+      // from domains.json). Trying all 8 dead TLDs per link just wastes time.
+      for (const domain of CONFIG.HUB_CLOUD_DOMAINS.slice(0, 2)) {
         const candidate = `https://${domain}${path}`;
         if (candidate !== url) candidates.push(candidate);
       }
@@ -692,8 +694,18 @@ async function mdriveLolExtractor(url, referer) {
       return [];
     }
 
+    // Resolve reachable hosts first: pixeldrain and direct video files work from
+    // datacenter IPs, whereas hubcloud often does not. Try those before hubcloud.
+    const priority = (h) => {
+      if (h.includes('pixeldrain') || /\.(mp4|mkv|m3u8)(?:$|\?)/i.test(h)) return 0;
+      if (h.includes('streamtape') || h.includes('drivehub') || h.includes('hubdrive')) return 1;
+      if (h.includes('hubcloud') || h.includes('hubcdn')) return 3;
+      return 2;
+    };
+    const ordered = [...new Set(candidates)].sort((a, b) => priority(a) - priority(b));
+
     const results = await Promise.allSettled(
-      [...new Set(candidates)].slice(0, 3).map(href => withTimeout(loadExtractor(href, url), 15000, []))
+      ordered.slice(0, 3).map(href => withTimeout(loadExtractor(href, url), 15000, []))
     );
     const out = [];
     results.forEach(r => { if (r.status === 'fulfilled' && r.value.length) out.push(...r.value); });

@@ -24,10 +24,53 @@ const { agent } = require('./config');
 // ── Configuration ──────────────────────────────────────────────────
 
 const CF_WORKER_URL = process.env.CF_WORKER_URL || '';
+const FLARESOLVERR_ENDPOINT = (process.env.FLARESOLVERR_ENDPOINT || '').replace(/\/$/, '');
 const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 const CURL_TIMEOUT = 25000; // 25s for system curl
 const WORKER_TIMEOUT = 15000; // 15s for CF Worker proxy
+const FS_TIMEOUT = 40000; // 40s per FlareSolverr attempt
 const TOTAL_BYPASS_BUDGET = 55000; // 55s max total
+
+// Serialize FlareSolverr calls so a single small VM isn't overwhelmed.
+let fsChain = Promise.resolve();
+function withFSLock(fn) {
+  const run = fsChain.then(fn, fn);
+  // keep the chain alive regardless of result
+  fsChain = run.then(() => {}, () => {});
+  return run;
+}
+
+// ── Per-host circuit breaker ──────────────────────────────────────
+// When a host fails on every method repeatedly, stop attempting it for a
+// cooldown so blocked origins don't burn the request time budget.
+const BREAKER_THRESHOLD = 3;          // consecutive total failures before opening
+const BREAKER_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+const hostBreaker = new Map();        // host -> { fails, openUntil }
+
+function getHost(url) {
+  try { return new URL(url).hostname; } catch (_) { return ''; }
+}
+
+function isBreakerOpen(host) {
+  const b = hostBreaker.get(host);
+  return !!(b && b.openUntil && Date.now() < b.openUntil);
+}
+
+function recordFailure(host) {
+  if (!host) return;
+  const b = hostBreaker.get(host) || { fails: 0, openUntil: 0 };
+  b.fails += 1;
+  if (b.fails >= BREAKER_THRESHOLD) {
+    b.openUntil = Date.now() + BREAKER_COOLDOWN_MS;
+    b.fails = 0;
+    console.log(`[bypass] circuit OPEN for ${host} — skipping for ${BREAKER_COOLDOWN_MS / 60000}min`);
+  }
+  hostBreaker.set(host, b);
+}
+
+function recordSuccess(host) {
+  if (host) hostBreaker.set(host, { fails: 0, openUntil: 0 });
+}
 
 // Chrome 131 headers
 const CHROME_HEADERS = {
@@ -189,6 +232,44 @@ async function tryCurlImpersonate(url, options = {}) {
   });
 }
 
+// ── Method 4: FlareSolverr (optional, solves real JS challenges) ───────────
+
+async function tryFlareSolverr(url, options = {}) {
+  if (!FLARESOLVERR_ENDPOINT) return null;
+
+  const cacheKey = `flaresolverr:${url}`;
+  return cache.getOrSet(cacheKey, () => withFSLock(async () => {
+    try {
+      const payload = {
+        cmd: 'request.get',
+        url,
+        maxTimeout: 30000,
+      };
+      const response = await axios.post(`${FLARESOLVERR_ENDPOINT}/v1`, payload, {
+        headers: { 'Content-Type': 'application/json' },
+        httpsAgent: agent,
+        timeout: options.timeout || FS_TIMEOUT,
+      });
+      const result = response.data;
+      if (result && result.status === 'ok' && result.solution) {
+        const body = result.solution.response || '';
+        if (body.length > 200 && !isCloudflareChallenge(body)) {
+          console.log(`[bypass] ✓ FlareSolverr solved ${getHost(url)} (${result.solution.status})`);
+          return body;
+        }
+      }
+      if (result && result.status !== 'ok') {
+        console.warn(`[bypass-FS] ${result.message || result.status}`);
+      }
+      return null;
+    } catch (e) {
+      const status = e.response?.status;
+      console.warn(`[bypass-FS] ${status ? 'HTTP ' + status : e.message.substring(0, 80)}`);
+      return null;
+    }
+  }), CACHE_TTL);
+}
+
 // ── Helpers ───────────────────────────────────────────────────
 
 function isCloudflareChallenge(body) {
@@ -225,12 +306,18 @@ async function fetchUrlWithBypass(url, options = {}) {
   const startTime = Date.now();
   const budget = options.budget || TOTAL_BYPASS_BUDGET;
   const remaining = () => budget - (Date.now() - startTime);
+  const host = getHost(url);
+
+  // Circuit breaker: skip hosts that have been failing on every method.
+  if (isBreakerOpen(host)) {
+    return null;
+  }
 
   console.log(`[bypass] Fetching ${url.substring(0, 60)}...`);
 
   // Method 1: CF Worker proxy (fast, if deployed)
   let result = await tryCFWorker(url, options);
-  if (result) return result;
+  if (result) { recordSuccess(host); return result; }
 
   if (remaining() <= 0) {
     console.log(`[bypass] Budget exhausted for ${url.substring(0, 60)}`);
@@ -239,7 +326,7 @@ async function fetchUrlWithBypass(url, options = {}) {
 
   // Method 2: System curl (medium speed, effective bypass)
   result = await trySystemCurl(url, { ...options, timeout: Math.min(remaining(), CURL_TIMEOUT) });
-  if (result) return result;
+  if (result) { recordSuccess(host); return result; }
 
   if (remaining() <= 0) {
     console.log(`[bypass] Budget exhausted for ${url.substring(0, 60)}`);
@@ -248,8 +335,13 @@ async function fetchUrlWithBypass(url, options = {}) {
 
   // Method 3: curl-impersonate (if installed)
   result = await tryCurlImpersonate(url, options);
-  if (result) return result;
+  if (result) { recordSuccess(host); return result; }
 
+  // Method 4: FlareSolverr (optional, solves real JS challenges)
+  result = await tryFlareSolverr(url, options);
+  if (result) { recordSuccess(host); return result; }
+
+  recordFailure(host);
   console.warn(`[bypass] ✗ All methods failed for ${url.substring(0, 60)} (${Date.now() - startTime}ms)`);
   return null;
 }
@@ -272,5 +364,6 @@ module.exports = {
   trySystemCurl,
   tryCurlImpersonate,
   tryCFWorker,
+  tryFlareSolverr,
   isCloudflareChallenge,
 };
